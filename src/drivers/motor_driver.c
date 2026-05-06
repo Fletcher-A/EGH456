@@ -61,13 +61,5 @@ MotorState_t motor_driver_get_state(void)
     return MOTOR_STATE_IDLE;
 }
 
-/*-----------------------------------------------------------*/
-
-void HallSensorHandler(void)
-{
-    /* TODO: 1. Read hall A/B/C GPIO levels.
-     * TODO: 2. updateMotor(ha, hb, hc).
-     * TODO: 3. Increment edge counter (used by speed_sensor).
-     * TODO: 4. GPIOIntClear() on the triggered pin(s).
-     */
-}
+/* HallSensorHandler is defined in tasks/motor_task.c (matches the
+ * supplied motorlib example). */
