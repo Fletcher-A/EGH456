@@ -36,6 +36,15 @@ uint32_t g_ui32SysClock;
 QueueHandle_t      xMotorQueue    = NULL;
 QueueHandle_t      xSensorQueue   = NULL;
 QueueHandle_t      xCommandQueue  = NULL;
+QueueHandle_t      xPowerRawQueue = NULL;
+QueueHandle_t      xAccelRawQueue = NULL;
+
+/* Runtime-adjustable safety thresholds. Initialised to the defaults
+ * from shared.h, mutated by the GUI Thresholds tab, read by the
+ * sensor task on each cycle. */
+volatile float g_thresh_power_w      = DEFAULT_POWER_LIMIT_W;
+volatile float g_thresh_accel_g      = DEFAULT_ACCEL_LIMIT_G;
+volatile float g_thresh_distance_mm  = DEFAULT_DISTANCE_LIMIT_MM;
 EventGroupHandle_t xSystemEvents  = NULL;
 SemaphoreHandle_t  xUARTMutex     = NULL;
 SemaphoreHandle_t  xI2CMutex      = NULL;
@@ -48,8 +57,6 @@ extern void vCreateFaultTask(void);
 
 static void prvSetupHardware(void);
 static void prvConfigureUART(void);
-static void prvConfigureI2C(void);
-static void prvConfigureButtons(void);
 
 /*-----------------------------------------------------------*/
 
@@ -61,11 +68,14 @@ int main(void)
     xMotorQueue    = xQueueCreate(8, sizeof(MotorMsgObj));
     xSensorQueue   = xQueueCreate(8, sizeof(SensorMsgObj));
     xCommandQueue  = xQueueCreate(4, sizeof(int32_t));   /* desired RPM commands */
+    xPowerRawQueue = xQueueCreate(64, sizeof(PowerSampleRaw_t)); /* ADC ISR -> sensor */
+    xAccelRawQueue = xQueueCreate(32, sizeof(AccelSampleRaw_t)); /* Timer1A -> sensor */
     xSystemEvents  = xEventGroupCreate();
     xUARTMutex     = xSemaphoreCreateMutex();
     xI2CMutex      = xSemaphoreCreateMutex();
 
     if (!xMotorQueue || !xSensorQueue || !xCommandQueue ||
+        !xPowerRawQueue || !xAccelRawQueue ||
         !xSystemEvents || !xUARTMutex  || !xI2CMutex)
     {
         for (;;) {}     /* RTOS object creation failed */
@@ -99,14 +109,10 @@ static void prvSetupHardware(void)
     PinoutSet(false, false);
 
     prvConfigureUART();
-    prvConfigureI2C();
-    prvConfigureButtons();
-
-    /* TODO: configure ADC channels for motor phase currents
-     *       (DRV8323 SOA/SOB pins).
-     * TODO: configure GPIO interrupts for hall sensors A/B/C.
-     * TODO: configure SPI for the LCD (handled by Kentec driver
-     *       inside the GUI task — verify pins don't clash). */
+    /* I2C0 is set up by the sensor task (via initI2C in i2cOptDriver).
+     * LCD/touch SPI is set up by the GUI task (Kentec...Init,
+     * TouchScreenInit). LaunchPad buttons aren't used — input is via
+     * the touchscreen. */
 }
 
 /*-----------------------------------------------------------*/
@@ -119,35 +125,11 @@ static void prvConfigureUART(void)
     GPIOPinConfigure(GPIO_PA1_U0TX);
     GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
     UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
-    UARTStdioConfig(0, 9600, 16000000);
+    /* 115200 baud — high enough for a 50 Hz CSV plot stream. */
+    UARTStdioConfig(0, 115200, 16000000);
 }
 
 /*-----------------------------------------------------------*/
-
-static void prvConfigureI2C(void)
-{
-    /* I2C0: PB2 (SCL) / PB3 (SDA), 100 kHz, used by the OPT3001
-       and the optional I2C sensors (SHT31, BMI160, VL53L0X). */
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_I2C0)) {}
-    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB)) {}
-    GPIOPinConfigure(GPIO_PB2_I2C0SCL);
-    GPIOPinConfigure(GPIO_PB3_I2C0SDA);
-    GPIOPinTypeI2CSCL(GPIO_PORTB_BASE, GPIO_PIN_2);
-    GPIOPinTypeI2C(GPIO_PORTB_BASE, GPIO_PIN_3);
-    I2CMasterInitExpClk(I2C0_BASE, g_ui32SysClock, false);
-}
-
-/*-----------------------------------------------------------*/
-
-static void prvConfigureButtons(void)
-{
-    ButtonsInit();
-    GPIOIntTypeSet(BUTTONS_GPIO_BASE, ALL_BUTTONS, GPIO_FALLING_EDGE);
-    GPIOIntEnable(BUTTONS_GPIO_BASE, ALL_BUTTONS);
-    IntEnable(INT_GPIOJ);
-}
 
 /*-----------------------------------------------------------*/
 /* Application-level RTOS hooks. */

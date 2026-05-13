@@ -1,31 +1,134 @@
 /*
- * speed_sensor.c — Convert hall-edge counts to RPM.
+ * speed_sensor.c — Hall-edge counter + 100 Hz RPM calculation.
  *
- * Algorithm:
- *   - speed_sensor_tick() called periodically (e.g. 10 ms = 100 Hz).
- *   - Snapshot the hall edge counter, reset it, compute RPM.
- *   - Optionally apply a low-pass filter to the result.
+ * See speed_sensor.h for the pipeline diagram and pin assumptions.
+ *
+ * Atomicity: g_edges is 32-bit, accessed by ISRs and the tick. The
+ * Cortex-M4F's 32-bit aligned loads/stores are atomic, so the tick
+ * does a disable-IRQ around the snapshot+clear to make it an atomic
+ * read-modify-write. The ISRs use a plain post-increment because
+ * they're the only writers and they can't pre-empt each other (NVIC
+ * priority is the same across the three port vectors by default).
  */
 
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "inc/hw_memmap.h"
+#include "inc/hw_ints.h"
+#include "driver_lib/gpio.h"
+#include "driver_lib/sysctl.h"
+#include "driver_lib/interrupt.h"
+
 #include "drivers/speed_sensor.h"
+
+/*-----------------------------------------------------------*/
+/* Pin assignments. Tune for the BoosterPack you have. */
+#define HALL_A_PORT       GPIO_PORTM_BASE
+#define HALL_A_PIN        GPIO_PIN_3
+#define HALL_A_PERIPH     SYSCTL_PERIPH_GPIOM
+#define HALL_A_INT_VEC    INT_GPIOM
+
+#define HALL_B_PORT       GPIO_PORTH_BASE
+#define HALL_B_PIN        GPIO_PIN_2
+#define HALL_B_PERIPH     SYSCTL_PERIPH_GPIOH
+#define HALL_B_INT_VEC    INT_GPIOH
+
+#define HALL_C_PORT       GPIO_PORTN_BASE
+#define HALL_C_PIN        GPIO_PIN_2
+#define HALL_C_PERIPH     SYSCTL_PERIPH_GPION
+#define HALL_C_INT_VEC    INT_GPION
+
+/*-----------------------------------------------------------*/
+
+static volatile uint32_t g_edges = 0;     /* incremented by every hall ISR */
+static volatile int32_t  g_rpm_raw  = 0;
+static volatile int32_t  g_rpm_filt = 0;
+
 /*-----------------------------------------------------------*/
 
 void speed_sensor_init(void)
 {
-    /* TODO: zero internal RPM state. */
+    /* Enable each hall port. */
+    SysCtlPeripheralEnable(HALL_A_PERIPH);
+    SysCtlPeripheralEnable(HALL_B_PERIPH);
+    SysCtlPeripheralEnable(HALL_C_PERIPH);
+    while (!SysCtlPeripheralReady(HALL_A_PERIPH)) {}
+    while (!SysCtlPeripheralReady(HALL_B_PERIPH)) {}
+    while (!SysCtlPeripheralReady(HALL_C_PERIPH)) {}
+
+    /* Pin direction = input with weak pull-up (hall sensors are
+     * open-drain on most BoosterPacks). */
+    GPIODirModeSet(HALL_A_PORT, HALL_A_PIN, GPIO_DIR_MODE_IN);
+    GPIODirModeSet(HALL_B_PORT, HALL_B_PIN, GPIO_DIR_MODE_IN);
+    GPIODirModeSet(HALL_C_PORT, HALL_C_PIN, GPIO_DIR_MODE_IN);
+    GPIOPadConfigSet(HALL_A_PORT, HALL_A_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(HALL_B_PORT, HALL_B_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(HALL_C_PORT, HALL_C_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+    /* Interrupt on BOTH edges so we get six counts per electrical rev. */
+    GPIOIntTypeSet(HALL_A_PORT, HALL_A_PIN, GPIO_BOTH_EDGES);
+    GPIOIntTypeSet(HALL_B_PORT, HALL_B_PIN, GPIO_BOTH_EDGES);
+    GPIOIntTypeSet(HALL_C_PORT, HALL_C_PIN, GPIO_BOTH_EDGES);
+
+    GPIOIntClear(HALL_A_PORT, HALL_A_PIN);
+    GPIOIntClear(HALL_B_PORT, HALL_B_PIN);
+    GPIOIntClear(HALL_C_PORT, HALL_C_PIN);
+
+    GPIOIntEnable(HALL_A_PORT, HALL_A_PIN);
+    GPIOIntEnable(HALL_B_PORT, HALL_B_PIN);
+    GPIOIntEnable(HALL_C_PORT, HALL_C_PIN);
+
+    IntEnable(HALL_A_INT_VEC);
+    IntEnable(HALL_B_INT_VEC);
+    IntEnable(HALL_C_INT_VEC);
 }
+
+/*-----------------------------------------------------------*/
+/* Per-port ISRs. Each only handles its own hall pin. */
+
+void HallPortMIntHandler(void)
+{
+    GPIOIntClear(HALL_A_PORT, HALL_A_PIN);
+    g_edges++;
+}
+
+void HallPortHIntHandler(void)
+{
+    GPIOIntClear(HALL_B_PORT, HALL_B_PIN);
+    g_edges++;
+}
+
+void HallPortNIntHandler(void)
+{
+    GPIOIntClear(HALL_C_PORT, HALL_C_PIN);
+    g_edges++;
+}
+
+/*-----------------------------------------------------------*/
+/* Periodic tick. Called from a 100 Hz software timer or task. */
 
 void speed_sensor_tick(uint32_t period_ms)
 {
-    (void)period_ms;
-    /* TODO: 1. Atomically read and reset the hall edge counter.
-     * TODO: 2. Compute RPM = (edges / EDGES_PER_REV) * (60_000 / period_ms).
-     * TODO: 3. Filter and store.
-     */
+    /* Atomic snapshot-and-clear of the edge counter. */
+    uint32_t edges;
+    IntMasterDisable();
+    edges    = g_edges;
+    g_edges  = 0;
+    IntMasterEnable();
+
+    /* RPM = (edges / period_s) / edges_per_rev * 60
+     *     = edges * 60_000 / (period_ms * edges_per_rev) */
+    int32_t rpm_raw = (int32_t)((edges * 60000UL) /
+                                (period_ms * SPEED_EDGES_PER_REV));
+
+    /* Exponential low-pass: y[n] = y[n-1] + alpha*(x - y[n-1]).
+     * alpha = 1/4 gives a ~40 ms time constant at 100 Hz —
+     * smooths quantisation noise on slow rotation without
+     * adding noticeable lag. */
+    g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 2);
+    g_rpm_raw  = rpm_raw;
 }
 
-int32_t speed_sensor_get_rpm(void)
-{
-    /* TODO: return last filtered RPM. */
-    return 0;
-}
+int32_t speed_sensor_get_rpm(void)      { return g_rpm_filt; }
+int32_t speed_sensor_get_rpm_raw(void)  { return g_rpm_raw;  }

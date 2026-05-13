@@ -39,7 +39,21 @@ SECTIONS
         _etext = .;
     } > FLASH
 
-    .data : AT(ADDR(.text) + SIZEOF(.text))
+    /* ARM exception unwinding tables, pulled in by libgcc helpers
+     * (e.g. __divdi3 from BME280's 64-bit pressure math). */
+    .ARM.extab :
+    {
+        *(.ARM.extab* .gnu.linkonce.armextab.*)
+    } > FLASH
+
+    .ARM.exidx :
+    {
+        __exidx_start = .;
+        *(.ARM.exidx* .gnu.linkonce.armexidx.*)
+        __exidx_end = .;
+    } > FLASH
+
+    .data : AT(ADDR(.ARM.exidx) + SIZEOF(.ARM.exidx))
     {
         _data = .;
         _ldata = LOADADDR (.data);

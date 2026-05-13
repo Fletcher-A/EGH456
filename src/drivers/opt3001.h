@@ -51,9 +51,6 @@ extern bool sensorOpt3001Enable(bool enable);
 extern bool sensorOpt3001Read(uint16_t *rawData);
 extern void sensorOpt3001Convert(uint16_t rawData, float *convertedLux);
 extern bool sensorOpt3001Test(void);
-extern bool sensorOpt3001ConfigureThreshold(void);
-extern bool sensorOpt3001SetLimits(void);
-extern bool sensorOpt3001ReadFlags(bool *highFlag, bool *lowFlag);
 
 #ifdef __cplusplus
 }

@@ -1,42 +1,24 @@
 /*
  * i2cOptDriver.c — interrupt-driven I2C driver for the OPT3001.
  *
- * Replaces the busy-wait polling version. Each transfer (write or read)
- * is started from task context, then the calling task blocks on a binary
- * semaphore. The I2C0 master interrupt advances a state machine through
- * the multi-byte transfer and gives the semaphore when the transfer is
- * complete or when an error is detected.
- *
- * State flow — write (reg + 2 data bytes):
- *   Task: DataPut(reg), BURST_SEND_START  ->  ISR fires
- *   ISR (WR_DATA0):  DataPut(data[0]), BURST_SEND_CONT  ->  ISR fires
- *   ISR (WR_DATA1):  DataPut(data[1]), BURST_SEND_FINISH  ->  ISR fires
- *   ISR (WR_DONE):   give semaphore
- *
- * State flow — read (write reg pointer, then receive 2 bytes):
- *   Task: DataPut(reg), SINGLE_SEND  ->  ISR fires
- *   ISR (RD_REG_SENT):  SlaveAddrSet(READ), BURST_RECEIVE_START  ->  ISR fires
- *   ISR (RD_DATA0):     data[0]=DataGet(), BURST_RECEIVE_FINISH  ->  ISR fires
- *   ISR (RD_DATA1):     data[1]=DataGet(), give semaphore
- *
- * Synchronisation: binary semaphore (not mutex). A binary semaphore is
- * used because the give comes from an ISR, not the same task that takes.
- * FreeRTOS mutexes carry task-ownership semantics that prevent ISR-side
- * giving; a binary semaphore has no owner and is the correct primitive
- * for ISR-to-task signalling.
- *
- * Timeout: xSemaphoreTake() uses a 200 ms deadline. If the ISR never
- * fires (bus stuck or clock-stretching hung), the function returns false
- * rather than blocking the calling task forever.
+ * Bare-metal port of the FreeRTOS lab 5 driver:
+ *   - Same state machine in the I2C ISR.
+ *   - Same write / read sequences.
+ *   - Instead of blocking on a FreeRTOS semaphore, the caller spins
+ *     on a `volatile bool g_done` flag set by the ISR.
+ *   - SysTick is used to enforce a millisecond timeout so a stuck
+ *     bus doesn't hang the system.
  */
 
 #include "drivers/i2cOptDriver.h"
 #include "inc/hw_memmap.h"
 #include "inc/hw_ints.h"
-#include "driverlib/i2c.h"
-#include "driverlib/interrupt.h"
-#include "FreeRTOS.h"
-#include "semphr.h"
+#include "driver_lib/gpio.h"
+#include "driver_lib/i2c.h"
+#include "driver_lib/interrupt.h"
+#include "driver_lib/pin_map.h"
+#include "driver_lib/sysctl.h"
+#include "driver_lib/systick.h"
 
 /*-----------------------------------------------------------*/
 
@@ -44,6 +26,7 @@ typedef enum {
     I2C_STATE_IDLE,
     I2C_STATE_WR_DATA0,
     I2C_STATE_WR_DATA1,
+    I2C_STATE_WR1_DATA0,    /* single-byte data write (BMI160 / BME280) */
     I2C_STATE_WR_DONE,
     I2C_STATE_RD_REG_SENT,
     I2C_STATE_RD_DATA0,
@@ -52,89 +35,119 @@ typedef enum {
 
 static volatile I2CState_t g_eState = I2C_STATE_IDLE;
 static volatile bool       g_bError = false;
+static volatile bool       g_bDone  = false;
 static uint8_t             g_ui8Addr;
 static uint8_t            *g_pui8Data;
-static SemaphoreHandle_t   xI2CDone  = NULL;
-static SemaphoreHandle_t   xI2CMutex = NULL;
 
-#define I2C_TIMEOUT_MS  200
+#define I2C_TIMEOUT_LOOPS  2000000   /* ~tens of ms at 120 MHz */
 
 /*-----------------------------------------------------------*/
 
-void initI2CDriver(void)
+void initI2C(uint32_t ui32SysClock)
 {
-    xI2CDone  = xSemaphoreCreateBinary();
-    xI2CMutex = xSemaphoreCreateMutex();
+    /* GPIO + I2C0 peripheral. */
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_I2C0)) {}
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB)) {}
+
+    GPIOPinConfigure(GPIO_PB2_I2C0SCL);
+    GPIOPinConfigure(GPIO_PB3_I2C0SDA);
+    GPIOPinTypeI2CSCL(GPIO_PORTB_BASE, GPIO_PIN_2);
+    GPIOPinTypeI2C(GPIO_PORTB_BASE, GPIO_PIN_3);
+    I2CMasterInitExpClk(I2C0_BASE, ui32SysClock, false);  /* 100 kHz */
+
+    /* Enable the master interrupt — our ISR drives the state machine. */
     I2CMasterIntEnable(I2C0_BASE);
     IntEnable(INT_I2C0);
 }
 
 /*-----------------------------------------------------------*/
 
+static bool prvWaitDone(void)
+{
+    /* Busy-wait on the done flag, bounded by a loop count. The ISR
+     * is what advances the state machine, so this loop just needs to
+     * yield long enough for it to fire several times. */
+    uint32_t spins = I2C_TIMEOUT_LOOPS;
+    while (!g_bDone && spins--) { }
+    if (!g_bDone)
+    {
+        g_eState = I2C_STATE_IDLE;
+        return false;
+    }
+    g_bDone = false;
+    return !g_bError;
+}
+
+/*-----------------------------------------------------------*/
+
 bool writeI2C(uint8_t ui8Addr, uint8_t ui8Reg, uint8_t *data)
 {
-    if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdPASS)
-        return false;
-
     g_ui8Addr  = ui8Addr;
     g_pui8Data = data;
     g_bError   = false;
+    g_bDone    = false;
     g_eState   = I2C_STATE_WR_DATA0;
 
     I2CMasterSlaveAddrSet(I2C0_BASE, ui8Addr, false);
     I2CMasterDataPut(I2C0_BASE, ui8Reg);
     I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_START);
 
-    if (xSemaphoreTake(xI2CDone, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdPASS)
-    {
-        g_eState = I2C_STATE_IDLE;
-        xSemaphoreGive(xI2CMutex);
-        return false;
-    }
-    xSemaphoreGive(xI2CMutex);
-    return !g_bError;
+    return prvWaitDone();
+}
+
+/*-----------------------------------------------------------*/
+
+/* Single-byte data write: { START, addr+W, reg, data, STOP }.
+ * Needed for sensors with 8-bit registers (BMI160, BME280). The
+ * 2-byte writeI2C() above is hardwired for OPT3001's 16-bit
+ * registers and spills a stray byte into reg+1. */
+bool writeI2C1(uint8_t ui8Addr, uint8_t ui8Reg, uint8_t data)
+{
+    static uint8_t s_one;
+    s_one = data;
+    g_ui8Addr  = ui8Addr;
+    g_pui8Data = &s_one;
+    g_bError   = false;
+    g_bDone    = false;
+    g_eState   = I2C_STATE_WR1_DATA0;
+
+    I2CMasterSlaveAddrSet(I2C0_BASE, ui8Addr, false);
+    I2CMasterDataPut(I2C0_BASE, ui8Reg);
+    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_START);
+
+    return prvWaitDone();
 }
 
 /*-----------------------------------------------------------*/
 
 bool readI2C(uint8_t ui8Addr, uint8_t ui8Reg, uint8_t *data)
 {
-    if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdPASS)
-        return false;
-
     g_ui8Addr  = ui8Addr;
     g_pui8Data = data;
     g_bError   = false;
+    g_bDone    = false;
     g_eState   = I2C_STATE_RD_REG_SENT;
 
     I2CMasterSlaveAddrSet(I2C0_BASE, ui8Addr, false);
     I2CMasterDataPut(I2C0_BASE, ui8Reg);
     I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_SINGLE_SEND);
 
-    if (xSemaphoreTake(xI2CDone, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdPASS)
-    {
-        g_eState = I2C_STATE_IDLE;
-        xSemaphoreGive(xI2CMutex);
-        return false;
-    }
-    xSemaphoreGive(xI2CMutex);
-    return !g_bError;
+    return prvWaitDone();
 }
 
 /*-----------------------------------------------------------*/
 
 void I2C0MasterIntHandler(void)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
     I2CMasterIntClear(I2C0_BASE);
 
     if (I2CMasterErr(I2C0_BASE) != I2C_MASTER_ERR_NONE)
     {
         g_bError = true;
         g_eState = I2C_STATE_IDLE;
-        xSemaphoreGiveFromISR(xI2CDone, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        g_bDone  = true;
         return;
     }
 
@@ -152,10 +165,15 @@ void I2C0MasterIntHandler(void)
             g_eState = I2C_STATE_WR_DONE;
             break;
 
+        case I2C_STATE_WR1_DATA0:
+            I2CMasterDataPut(I2C0_BASE, g_pui8Data[0]);
+            I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_FINISH);
+            g_eState = I2C_STATE_WR_DONE;
+            break;
+
         case I2C_STATE_WR_DONE:
             g_eState = I2C_STATE_IDLE;
-            xSemaphoreGiveFromISR(xI2CDone, &xHigherPriorityTaskWoken);
-            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            g_bDone  = true;
             break;
 
         case I2C_STATE_RD_REG_SENT:
@@ -173,12 +191,12 @@ void I2C0MasterIntHandler(void)
         case I2C_STATE_RD_DATA1:
             g_pui8Data[1] = (uint8_t)I2CMasterDataGet(I2C0_BASE);
             g_eState = I2C_STATE_IDLE;
-            xSemaphoreGiveFromISR(xI2CDone, &xHigherPriorityTaskWoken);
-            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            g_bDone  = true;
             break;
 
         default:
             g_eState = I2C_STATE_IDLE;
+            g_bDone  = true;
             break;
     }
 }

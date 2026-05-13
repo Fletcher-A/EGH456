@@ -8,7 +8,12 @@
 
 #include <stdbool.h>
 
+#include <stdint.h>
+
 bool bmi160_init(void);
 bool bmi160_read_accel_g(float *ax, float *ay, float *az);
+bool bmi160_read_accel_raw(int16_t *ax, int16_t *ay, int16_t *az);
+bool bmi160_read_y_g(float *ay);
+float bmi160_lsb_per_g(void);      /* For converting raw -> g */
 
 #endif /* BMI160_H */

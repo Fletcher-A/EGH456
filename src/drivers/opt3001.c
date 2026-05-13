@@ -70,32 +70,13 @@
 #define CONFIG_RESET                    0xC810                   
 #define CONFIG_TEST                     0xCC10
 
-/* Lab 5: 100ms conversion time chosen for 5 Hz sampling.
- * Sensor register 0xC400: auto range, CT=100ms (bit[11]=0), continuous,
- * transparent comparison mode (no latching needed for Task B).
- * Stored little-endian in MCU: 0x00C4 -> wire bytes [0xC4, 0x00] -> sensor receives 0xC400 */
+/* Same config as lab 5: 100 ms continuous conversion, auto range.
+ * Sensor register 0xC400, MCU value 0x00C4 -> wire bytes [0xC4, 0x00]. */
 #define CONFIG_ENABLE                   0x00C4
-#define CONFIG_DISABLE                  0x00C0 // shutdown: bits[10:9]=00
-
-/* Task D threshold config: 800ms CT, continuous, latched window-style, active-low POL.
- * Sensor register value = 0xCE10:
- *   bits[15:12]=1100 (auto range), bit[11]=1 (800ms), bits[10:9]=11 (continuous),
- *   bit[4]=1 (latched window), bit[3]=0 (active low)
- * Stored little-endian in MCU: 0x10CE -> wire bytes [0xCE, 0x10] -> sensor receives 0xCE10 */
-#define CONFIG_THRESHOLD                0x10CE
-
-/* Low limit: 40.95 lux — E=0, M=4095 -> 4095 * 0.01 * 2^0 = 40.95 lux  (given in table)
- * Sensor register = 0x0FFF. MCU value = 0xFF0F */
-#define LOW_LIMIT_VAL                   0xFF0F
-
-/* High limit: 2818.56 lux — E=7, M=2202 -> 2202 * 0.01 * 2^7 = 2818.56 lux (given in table)
- * Sensor register = 0x789A. MCU value = 0x9A78 */
-#define HIGH_LIMIT_VAL                  0x9A78
+#define CONFIG_DISABLE                  0x00C0
 
 /* Bit values */
 #define DATA_RDY_BIT                    0x0080  // Data ready
-#define FLAG_HIGH_BIT                   0x0040  // FH: light exceeded high limit
-#define FLAG_LOW_BIT                    0x0020  // FL: light fell below low limit
 
 /* Register length */
 #define REGISTER_LENGTH                 2
@@ -272,34 +253,6 @@ void sensorOpt3001Convert(uint16_t rawData, float *convertedLux)
 	m = rawData & 0x0FFF;
 	e = (rawData & 0xF000) >> 12;
 
-	*convertedLux = m * (0.01 * exp2(e));
-}
-
-bool sensorOpt3001ConfigureThreshold(void)
-{
-    uint16_t val = CONFIG_THRESHOLD;
-    return writeI2C(OPT3001_I2C_ADDRESS, REG_CONFIGURATION, (uint8_t *)&val);
-}
-
-bool sensorOpt3001SetLimits(void)
-{
-    uint16_t low  = LOW_LIMIT_VAL;
-    uint16_t high = HIGH_LIMIT_VAL;
-
-    if (!writeI2C(OPT3001_I2C_ADDRESS, REG_LOW_LIMIT,  (uint8_t *)&low))
-        return false;
-    if (!writeI2C(OPT3001_I2C_ADDRESS, REG_HIGH_LIMIT, (uint8_t *)&high))
-        return false;
-    return true;
-}
-
-bool sensorOpt3001ReadFlags(bool *highFlag, bool *lowFlag)
-{
-    uint16_t val;
-    if (!readI2C(OPT3001_I2C_ADDRESS, REG_CONFIGURATION, (uint8_t *)&val))
-        return false;
-    val = (val >> 8) | (val << 8);
-    *highFlag = (val & FLAG_HIGH_BIT) != 0;
-    *lowFlag  = (val & FLAG_LOW_BIT)  != 0;
-    return true;
+	/* Bit-shift instead of exp2() to avoid any math-library dependency. */
+	*convertedLux = m * 0.01f * (float)(1UL << e);
 }

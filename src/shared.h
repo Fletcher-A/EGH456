@@ -42,6 +42,7 @@ typedef struct
     int32_t    rpm_reference;
     int32_t    rpm_desired;
     uint16_t   pwm_duty;
+    float      power_watts;        /* filtered motor power (W) */
     MotorState_t state;
 } MotorMsgObj;
 
@@ -50,10 +51,19 @@ typedef struct
     uint32_t   seq;
     TickType_t tick;
     float      power_watts;        /* filtered motor power */
-    float      light_lux;          /* filtered ambient light */
-    /* TODO: add fields for the two optional sensors you choose */
-    float      optional_a;
-    float      optional_b;
+    float      light_lux;          /* filtered ambient light (OPT3001) */
+
+    /* BMI160 accelerometer — all three axes in g. */
+    float      accel_x_g;
+    float      accel_y_g;
+    float      accel_z_g;
+    float      accel_total_g;      /* filtered |ax|+|ay|+|az|, for E-stop */
+
+    /* BME280 environmental sensor. */
+    float      temp_c;             /* deg C  */
+    float      humidity_pct;       /* %RH    */
+    float      pressure_hpa;       /* hPa    */
+    bool       bme_ok;             /* false until BME280 init succeeds */
 } SensorMsgObj;
 
 /*-----------------------------------------------------------*/
@@ -62,6 +72,23 @@ typedef struct
 extern QueueHandle_t      xMotorQueue;     /* motor task -> gui */
 extern QueueHandle_t      xSensorQueue;    /* sensor task -> gui */
 extern QueueHandle_t      xCommandQueue;   /* gui -> motor task */
+extern QueueHandle_t      xPowerRawQueue;  /* ADC ISR -> sensor task (raw counts) */
+extern QueueHandle_t      xAccelRawQueue;  /* Timer ISR -> sensor task (raw axes) */
+
+/* One sample = (ia_counts, ib_counts) captured at the same instant. */
+typedef struct
+{
+    uint16_t ia_counts;
+    uint16_t ib_counts;
+} PowerSampleRaw_t;
+
+/* Raw 16-bit accel counts (BMI160 LSBs). The task converts to g. */
+typedef struct
+{
+    int16_t ax_raw;
+    int16_t ay_raw;
+    int16_t az_raw;
+} AccelSampleRaw_t;
 extern EventGroupHandle_t xSystemEvents;
 extern SemaphoreHandle_t  xUARTMutex;
 extern SemaphoreHandle_t  xI2CMutex;       /* shared I2C bus mutex */
@@ -90,9 +117,16 @@ extern SemaphoreHandle_t  xI2CMutex;       /* shared I2C bus mutex */
 /* Tunable thresholds (initial values; GUI can override at runtime) */
 
 #define DEFAULT_POWER_LIMIT_W      150.0f
-#define DEFAULT_ACCEL_LIMIT_MS2    20.0f
-#define DEFAULT_DISTANCE_LIMIT_MM  200
+#define DEFAULT_ACCEL_LIMIT_G      2.0f       /* total |a| in g */
+#define DEFAULT_DISTANCE_LIMIT_MM  200.0f
 #define NIGHT_LIGHT_LUX            5.0f
+
+/* Runtime-editable thresholds (GUI Thresholds tab writes; sensor task
+ * reads). Defined once in main.c. Single-word writes are atomic on
+ * Cortex-M4, so no mutex is needed. */
+extern volatile float g_thresh_power_w;
+extern volatile float g_thresh_accel_g;
+extern volatile float g_thresh_distance_mm;
 
 /* Motor ramp limits (assignment 2.1.3) */
 #define ACCEL_LIMIT_RPMPS          500
