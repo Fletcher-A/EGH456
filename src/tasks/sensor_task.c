@@ -52,6 +52,7 @@
 #include "drivers/opt3001.h"
 #include "drivers/bmi160.h"
 #include "drivers/bme280.h"
+#include "drivers/sht31.h"
 #include "drivers/power_sensor.h"
 #include "utils/uartstdio.h"
 
@@ -342,7 +343,8 @@ static void prvSensorTask(void *pvParameters)
         if (bme_ok && (tick_count % BME_READ_EVERY_N) == 0)
         {
             xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-            bme280_read(&temp_c, &hum_pct, &pres_hpa);
+            //bme280_read(&temp_c, &hum_pct, &pres_hpa);
+            sht31_read(&temp_c, &hum_pct);
             xSemaphoreGive(xI2CMutex);
         }
 
