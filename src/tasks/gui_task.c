@@ -112,6 +112,7 @@ static float        g_temp_c          = 0.0f;
 static float        g_humidity_pct    = 0.0f;
 static float        g_pressure_hpa    = 0.0f;
 static bool         g_bme_ok          = false;
+static bool         g_sht_ok          = false;
 
 /* Tab state. */
 static volatile int32_t g_pendingPanel = -1;
@@ -278,29 +279,47 @@ Canvas(g_sPlotCanvas, g_psPanels + 1, 0, 0, &g_sKentec320x240x16_SSD2119,
 #define PLOT_POWER_MAX   200.0f
 #define PLOT_LUX_MAX     500.0f
 #define PLOT_ACCEL_MAX     2.0f       /* +-2 g full scale, centred on plot */
+#define PLOT_TEMP_MAX     50.0f       /* 0..50 deg C */
+#define PLOT_HUM_MAX     100.0f       /* 0..100 %RH */
+#define PLOT_PRESS_MIN   950.0f       /* hPa baseline (subtracted before plotting) */
+#define PLOT_PRESS_SPAN  100.0f       /* 950..1050 hPa visible range */
 
 static float    g_plot_rpm  [PLOT_SAMPLES];
 static float    g_plot_power[PLOT_SAMPLES];
 static float    g_plot_lux  [PLOT_SAMPLES];
 static float    g_plot_accel[PLOT_SAMPLES];
+static float    g_plot_temp [PLOT_SAMPLES];
+static float    g_plot_hum  [PLOT_SAMPLES];
+static float    g_plot_press[PLOT_SAMPLES];
 static float    g_rpm_flat  [PLOT_SAMPLES];
 static float    g_pow_flat  [PLOT_SAMPLES];
 static float    g_lux_flat  [PLOT_SAMPLES];
 static float    g_acc_flat  [PLOT_SAMPLES];
+static float    g_temp_flat [PLOT_SAMPLES];
+static float    g_hum_flat  [PLOT_SAMPLES];
+static float    g_press_flat[PLOT_SAMPLES];
 static float    g_prev_rpm  [PLOT_SAMPLES];
 static float    g_prev_pow  [PLOT_SAMPLES];
 static float    g_prev_lux  [PLOT_SAMPLES];
 static float    g_prev_acc  [PLOT_SAMPLES];
+static float    g_prev_temp [PLOT_SAMPLES];
+static float    g_prev_hum  [PLOT_SAMPLES];
+static float    g_prev_press[PLOT_SAMPLES];
 static uint32_t g_prev_count = 0;
 static uint32_t g_plot_head  = 0;
 static uint32_t g_plot_count = 0;
 
-static void prvPlotPush(float rpm, float power, float lux, float accel)
+static void prvPlotPush(float rpm, float power, float lux, float accel,
+                        float temp_c, float hum_pct, float press_hpa)
 {
     g_plot_rpm  [g_plot_head] = rpm;
     g_plot_power[g_plot_head] = power;
     g_plot_lux  [g_plot_head] = lux;
     g_plot_accel[g_plot_head] = accel;
+    g_plot_temp [g_plot_head] = temp_c;
+    g_plot_hum  [g_plot_head] = hum_pct;
+    /* Subtract baseline so the 950..1050 hPa range maps onto 0..span. */
+    g_plot_press[g_plot_head] = press_hpa - PLOT_PRESS_MIN;
     g_plot_head = (g_plot_head + 1) % PLOT_SAMPLES;
     if (g_plot_count < PLOT_SAMPLES) g_plot_count++;
 }
@@ -349,10 +368,13 @@ static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
     /* Erase previous frame in black. */
     if (g_prev_count >= 2)
     {
-        prvDrawTrace(psContext, g_prev_rpm, g_prev_count, PLOT_RPM_MAX,   ClrBlack, false);
-        prvDrawTrace(psContext, g_prev_pow, g_prev_count, PLOT_POWER_MAX, ClrBlack, false);
-        prvDrawTrace(psContext, g_prev_lux, g_prev_count, PLOT_LUX_MAX,   ClrBlack, false);
-        prvDrawTrace(psContext, g_prev_acc, g_prev_count, PLOT_ACCEL_MAX, ClrBlack, true);
+        prvDrawTrace(psContext, g_prev_rpm,   g_prev_count, PLOT_RPM_MAX,    ClrBlack, false);
+        prvDrawTrace(psContext, g_prev_pow,   g_prev_count, PLOT_POWER_MAX,  ClrBlack, false);
+        prvDrawTrace(psContext, g_prev_lux,   g_prev_count, PLOT_LUX_MAX,    ClrBlack, false);
+        prvDrawTrace(psContext, g_prev_acc,   g_prev_count, PLOT_ACCEL_MAX,  ClrBlack, true);
+        prvDrawTrace(psContext, g_prev_temp,  g_prev_count, PLOT_TEMP_MAX,   ClrBlack, false);
+        prvDrawTrace(psContext, g_prev_hum,   g_prev_count, PLOT_HUM_MAX,    ClrBlack, false);
+        prvDrawTrace(psContext, g_prev_press, g_prev_count, PLOT_PRESS_SPAN, ClrBlack, false);
     }
 
     /* Unroll circular buffer. */
@@ -360,45 +382,83 @@ static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
     for (uint32_t i = 0; i < g_plot_count; i++)
     {
         uint32_t idx = (start + i) % PLOT_SAMPLES;
-        g_rpm_flat[i] = g_plot_rpm  [idx];
-        g_pow_flat[i] = g_plot_power[idx];
-        g_lux_flat[i] = g_plot_lux  [idx];
-        g_acc_flat[i] = g_plot_accel[idx];
+        g_rpm_flat  [i] = g_plot_rpm  [idx];
+        g_pow_flat  [i] = g_plot_power[idx];
+        g_lux_flat  [i] = g_plot_lux  [idx];
+        g_acc_flat  [i] = g_plot_accel[idx];
+        g_temp_flat [i] = g_plot_temp [idx];
+        g_hum_flat  [i] = g_plot_hum  [idx];
+        g_press_flat[i] = g_plot_press[idx];
     }
 
     /* Draw current frame. */
-    prvDrawTrace(psContext, g_rpm_flat, g_plot_count, PLOT_RPM_MAX,   ClrGoldenrod, false);
-    prvDrawTrace(psContext, g_pow_flat, g_plot_count, PLOT_POWER_MAX, ClrCyan,      false);
-    prvDrawTrace(psContext, g_lux_flat, g_plot_count, PLOT_LUX_MAX,   ClrWhite,     false);
-    prvDrawTrace(psContext, g_acc_flat, g_plot_count, PLOT_ACCEL_MAX, ClrMagenta,   true);
+    prvDrawTrace(psContext, g_rpm_flat,   g_plot_count, PLOT_RPM_MAX,    ClrGoldenrod, false);
+    prvDrawTrace(psContext, g_pow_flat,   g_plot_count, PLOT_POWER_MAX,  ClrCyan,      false);
+    prvDrawTrace(psContext, g_lux_flat,   g_plot_count, PLOT_LUX_MAX,    ClrWhite,     false);
+    prvDrawTrace(psContext, g_acc_flat,   g_plot_count, PLOT_ACCEL_MAX,  ClrMagenta,   true);
+    prvDrawTrace(psContext, g_temp_flat,  g_plot_count, PLOT_TEMP_MAX,   ClrOrange,    false);
+    prvDrawTrace(psContext, g_hum_flat,   g_plot_count, PLOT_HUM_MAX,    ClrTurquoise, false);
+    prvDrawTrace(psContext, g_press_flat, g_plot_count, PLOT_PRESS_SPAN, ClrLimeGreen, false);
 
     /* Snapshot for next erase. */
     for (uint32_t i = 0; i < g_plot_count; i++)
     {
-        g_prev_rpm[i] = g_rpm_flat[i];
-        g_prev_pow[i] = g_pow_flat[i];
-        g_prev_lux[i] = g_lux_flat[i];
-        g_prev_acc[i] = g_acc_flat[i];
+        g_prev_rpm  [i] = g_rpm_flat  [i];
+        g_prev_pow  [i] = g_pow_flat  [i];
+        g_prev_lux  [i] = g_lux_flat  [i];
+        g_prev_acc  [i] = g_acc_flat  [i];
+        g_prev_temp [i] = g_temp_flat [i];
+        g_prev_hum  [i] = g_hum_flat  [i];
+        g_prev_press[i] = g_press_flat[i];
     }
     g_prev_count = g_plot_count;
 
-    /* Y-axis labels. */
+    /* Axis labels — maxima across the top, minima across the bottom,
+     * each colour-matched to its trace.  Compacted (no spaces inside
+     * units) so the seven labels fit across the 296-px plot width. */
     GrContextFontSet(psContext, &g_sFontCm12);
     GrContextBackgroundSet(psContext, ClrBlack);
+
+    const int yTop = PLOT_Y + 2;
+    const int yBot = PLOT_Y + PLOT_H - 14;
+
+    /* Column X offsets within the plot. Tuned to leave a couple of
+     * pixels gap between adjacent labels at 12-pt CM. */
+    const int xRPM   = PLOT_X + 4;
+    const int xPow   = PLOT_X + 50;
+    const int xLux   = PLOT_X + 84;
+    const int xAcc   = PLOT_X + 122;
+    const int xTemp  = PLOT_X + 150;
+    const int xHum   = PLOT_X + 180;
+    const int xPres  = PLOT_X + 232;
+
     GrContextForegroundSet(psContext, ClrGoldenrod);
-    GrStringDraw(psContext, "4000 RPM", -1, PLOT_X + 4, PLOT_Y + 2,  1);
+    GrStringDraw(psContext, "4000RPM",  -1, xRPM,  yTop, 1);
+    GrStringDraw(psContext, "0RPM",     -1, xRPM,  yBot, 1);
+
     GrContextForegroundSet(psContext, ClrCyan);
-    GrStringDraw(psContext, "200 W",    -1, PLOT_X + 4, PLOT_Y + 16, 1);
+    GrStringDraw(psContext, "200W",     -1, xPow,  yTop, 1);
+    GrStringDraw(psContext, "0W",       -1, xPow,  yBot, 1);
+
     GrContextForegroundSet(psContext, ClrWhite);
-    GrStringDraw(psContext, "500 lux",  -1, PLOT_X + 4, PLOT_Y + 30, 1);
+    GrStringDraw(psContext, "500lx",    -1, xLux,  yTop, 1);
+    GrStringDraw(psContext, "0lx",      -1, xLux,  yBot, 1);
+
     GrContextForegroundSet(psContext, ClrMagenta);
-    GrStringDraw(psContext, "+2 g",     -1, PLOT_X + 4, PLOT_Y + 44, 1);
-    GrStringDraw(psContext, "0 g",      -1, PLOT_X + 4,
-                 PLOT_Y + (PLOT_H / 2) - 6, 1);
-    GrStringDraw(psContext, "-2 g",     -1, PLOT_X + 4,
-                 PLOT_Y + PLOT_H - 28, 1);
-    GrContextForegroundSet(psContext, ClrSilver);
-    GrStringDraw(psContext, "0",        -1, PLOT_X + 4, PLOT_Y + PLOT_H - 14, 1);
+    GrStringDraw(psContext, "+2g",      -1, xAcc,  yTop, 1);
+    GrStringDraw(psContext, "-2g",      -1, xAcc,  yBot, 1);
+
+    GrContextForegroundSet(psContext, ClrOrange);
+    GrStringDraw(psContext, "50C",      -1, xTemp, yTop, 1);
+    GrStringDraw(psContext, "0C",       -1, xTemp, yBot, 1);
+
+    GrContextForegroundSet(psContext, ClrTurquoise);
+    GrStringDraw(psContext, "100%RH",   -1, xHum,  yTop, 1);
+    GrStringDraw(psContext, "0%RH",     -1, xHum,  yBot, 1);
+
+    GrContextForegroundSet(psContext, ClrLimeGreen);
+    GrStringDraw(psContext, "1050hPa",  -1, xPres, yTop, 1);
+    GrStringDraw(psContext, "950hPa",   -1, xPres, yBot, 1);
 }
 
 /*-----------------------------------------------------------*/
@@ -1064,9 +1124,11 @@ static void prvRedrawWidgets(void)
         int temp_10 = (int)(g_temp_c       * 10.0f + 0.5f);
         int hum_10  = (int)(g_humidity_pct * 10.0f + 0.5f);
         int pres_10 = (int)(g_pressure_hpa * 10.0f + 0.5f);
+        /* T/H come from the SHT31 only (spec). BME280's T/H is
+         * intentionally discarded in sensor_task. */
         if (temp_10 != last_temp_10)
         {
-            if (g_bme_ok) usprintf(s_temp, "Temp:  %d.%d C",
+            if (g_sht_ok) usprintf(s_temp, "Temp:  %d.%d C",
                                    temp_10 / 10, temp_10 % 10);
             else          usprintf(s_temp, "Temp:  --- C");
             CanvasTextSet(&g_sSensTempText, s_temp);
@@ -1075,7 +1137,7 @@ static void prvRedrawWidgets(void)
         }
         if (hum_10 != last_hum_10)
         {
-            if (g_bme_ok) usprintf(s_hum, "Hum:   %d.%d %%",
+            if (g_sht_ok) usprintf(s_hum, "Hum:   %d.%d %%",
                                    hum_10 / 10, hum_10 % 10);
             else          usprintf(s_hum, "Hum:   --- %%");
             CanvasTextSet(&g_sSensHumText, s_hum);
@@ -1171,6 +1233,7 @@ static void prvGuiTask(void *pvParameters)
             g_humidity_pct = sensor_msg.humidity_pct;
             g_pressure_hpa = sensor_msg.pressure_hpa;
             g_bme_ok       = sensor_msg.bme_ok;
+            g_sht_ok       = sensor_msg.sht_ok;
         }
 
         /* 4. Refresh whichever readout tab is currently showing. */
@@ -1182,7 +1245,8 @@ static void prvGuiTask(void *pvParameters)
         if (now - last_sample_tick >= pdMS_TO_TICKS(200))
         {
             last_sample_tick = now;
-            prvPlotPush((float)g_rpm_actual, g_power_w, g_light_lux, g_accel_g);
+            prvPlotPush((float)g_rpm_actual, g_power_w, g_light_lux, g_accel_g,
+                        g_temp_c, g_humidity_pct, g_pressure_hpa);
         }
 
         /* 6. Repaint the plot at ~5 Hz only while the Plots tab is up. */

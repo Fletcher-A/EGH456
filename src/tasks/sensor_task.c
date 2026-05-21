@@ -251,6 +251,14 @@ static void prvSensorTask(void *pvParameters)
         uart_log_printf("Accel sampler (Timer2A @ %d Hz)\n", ACCEL_SAMPLE_HZ);
     }
 
+    /* SHT31 (T+RH, spec 2.2.2 primary) — required */
+    uart_log_printf("SHT31 init...\n");
+    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+    bool sht_ok = sht31_init();
+    xSemaphoreGive(xI2CMutex);
+    uart_log_printf("SHT31 %s\n", sht_ok ? "ready" : "init FAILED");
+
+    /* BME280 (pressure only — T+H come from SHT31). */
     uart_log_printf("BME280 init...\n");
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool bme_ok = bme280_init();
@@ -352,13 +360,34 @@ static void prvSensorTask(void *pvParameters)
             xEventGroupClearBits(xSystemEvents, EVT_ESTOP_ACCEL);
         }
 
-        /* ---- BME280: 1 Hz read (its own internal oversampling). */
-        if (bme_ok && (tick_count % BME_READ_EVERY_N) == 0)
+        /* ---- Environment: 1 Hz read.
+         * SHT31 -> temp_c + hum_pct (spec-required T/H sensor).
+         * BME280 -> pressure only; its own T/H is discarded so we
+         * don't disagree with the SHT31. Each gated independently
+         * so one missing sensor doesn't take down the other. */
+        if ((tick_count % BME_READ_EVERY_N) == 0)
         {
-            xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-            //bme280_read(&temp_c, &hum_pct, &pres_hpa);
-            sht31_read(&temp_c, &hum_pct);
-            xSemaphoreGive(xI2CMutex);
+            /* SHT31: spec-required source for temperature + humidity.
+             * If absent, temp_c / hum_pct stay zero and the GUI
+             * displays "--- C" / "--- %". */
+            if (sht_ok)
+            {
+                xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+                bool sok = sht31_read(&temp_c, &hum_pct);
+                xSemaphoreGive(xI2CMutex);
+                if (!sok) sht_ok = false;
+            }
+
+            /* BME280: read for pressure only. Its own T+H values are
+             * discarded so we don't disagree with the SHT31. */
+            if (bme_ok)
+            {
+                float bme_t_unused, bme_h_unused;
+                xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+                bme280_read(&bme_t_unused, &bme_h_unused, &pres_hpa);
+                xSemaphoreGive(xI2CMutex);
+                (void)bme_t_unused; (void)bme_h_unused;
+            }
         }
 
         /* ---- Publish to GUI at 5 Hz. */
@@ -377,6 +406,7 @@ static void prvSensorTask(void *pvParameters)
             msg.temp_c        = temp_c;
             msg.humidity_pct  = hum_pct;
             msg.pressure_hpa  = pres_hpa;
+            msg.sht_ok        = sht_ok;
             msg.bme_ok        = bme_ok;
             xQueueSend(xSensorQueue, &msg, 0);
         }

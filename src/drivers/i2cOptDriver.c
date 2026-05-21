@@ -170,6 +170,12 @@ void I2C0MasterIntHandler(void)
 
     if (I2CMasterErr(I2C0_BASE) != I2C_MASTER_ERR_NONE)
     {
+        /* Address NACK during a BURST transaction leaves the master
+         * holding the bus low. Issue an explicit ERROR_STOP so SDA/SCL
+         * get released — otherwise probes for absent sensors (e.g.
+         * sht31_init at 0x44 with no chip fitted) wedge the bus for
+         * every subsequent transaction. */
+        I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_ERROR_STOP);
         g_bError = true;
         g_eState = I2C_STATE_IDLE;
         g_bDone  = true;

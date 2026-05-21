@@ -62,11 +62,13 @@ typedef struct
     float      accel_z_g;
     float      accel_total_g;      /* filtered |ax|+|ay|+|az|, for E-stop */
 
-    /* BME280 environmental sensor. */
-    float      temp_c;             /* deg C  */
-    float      humidity_pct;       /* %RH    */
-    float      pressure_hpa;       /* hPa    */
-    bool       bme_ok;             /* false until BME280 init succeeds */
+    /* Environmental sensing. SHT31 provides T+RH (spec 2.2.2 #2);
+     * BME280 lives on the same bus and contributes pressure only. */
+    float      temp_c;             /* deg C  (SHT31) */
+    float      humidity_pct;       /* %RH    (SHT31) */
+    float      pressure_hpa;       /* hPa    (BME280) */
+    bool       sht_ok;             /* SHT31 init succeeded */
+    bool       bme_ok;             /* BME280 init succeeded (pressure only) */
 } SensorMsgObj;
 
 /*-----------------------------------------------------------*/
