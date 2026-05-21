@@ -30,7 +30,9 @@ typedef enum {
     I2C_STATE_WR_DONE,
     I2C_STATE_RD_REG_SENT,
     I2C_STATE_RD_DATA0,
-    I2C_STATE_RD_DATA1
+    I2C_STATE_RD_DATA1,
+    I2C_STATE_RD_SHT31,
+    I2C_STATE_RD_SHT31_FIN
 } I2CState_t;
 
 static volatile I2CState_t g_eState = I2C_STATE_IDLE;
@@ -38,6 +40,9 @@ static volatile bool       g_bError = false;
 static volatile bool       g_bDone  = false;
 static uint8_t             g_ui8Addr;
 static uint8_t            *g_pui8Data;
+
+// used by the sht to count to 6
+static uint8_t sht31Count = 0;
 
 #define I2C_TIMEOUT_LOOPS  2000000   /* ~tens of ms at 120 MHz */
 
@@ -138,6 +143,26 @@ bool readI2C(uint8_t ui8Addr, uint8_t ui8Reg, uint8_t *data)
 }
 
 /*-----------------------------------------------------------*/
+/* Initiates SHT31 read
+*/
+bool readSHT31(uint8_t ui8Addr, uint8_t *data)
+{
+    // uiAddr will always be 0x44
+    g_ui8Addr  = ui8Addr;
+    g_pui8Data = data;
+    g_bError   = false;
+    g_bDone    = false;
+    g_eState   = I2C_STATE_RD_SHT31;
+    sht31Count = 0;
+
+    I2CMasterSlaveAddrSet(I2C0_BASE, ui8Addr, true);
+    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_RECEIVE_START);
+
+    return prvWaitDone();
+}
+
+
+/*-----------------------------------------------------------*/
 
 void I2C0MasterIntHandler(void)
 {
@@ -190,6 +215,23 @@ void I2C0MasterIntHandler(void)
 
         case I2C_STATE_RD_DATA1:
             g_pui8Data[1] = (uint8_t)I2CMasterDataGet(I2C0_BASE);
+            g_eState = I2C_STATE_IDLE;
+            g_bDone  = true;
+            break;
+
+        case I2C_STATE_RD_SHT31:
+            g_pui8Data[sht31Count++] = (uint8_t)I2CMasterDataGet(I2C0_BASE);
+            if (sht31Count >  5)
+            {
+                I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_RECEIVE_FINISH);
+                g_eState = I2C_STATE_RD_SHT31_FIN;
+            } else {
+                I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_RECEIVE_CONT);
+                g_eState = I2C_STATE_RD_SHT31; // 
+            }
+            break;       
+        case I2C_STATE_RD_SHT31_FIN:
+            g_pui8Data[5] = (uint8_t)I2CMasterDataGet(I2C0_BASE);
             g_eState = I2C_STATE_IDLE;
             g_bDone  = true;
             break;
