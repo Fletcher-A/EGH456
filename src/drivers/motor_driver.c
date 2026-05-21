@@ -40,21 +40,41 @@ static void prvMotorLibTaskExit(void)
 
 static void prvInitDrvNfaultInput(void)
 {
+#if MOTOR_ENABLE_NFAULT_MONITORING
     SysCtlPeripheralEnable(DRV_NFAULT_PERIPH);
     while (!SysCtlPeripheralReady(DRV_NFAULT_PERIPH)) {}
     GPIODirModeSet(DRV_NFAULT_PORT, DRV_NFAULT_PIN, GPIO_DIR_MODE_IN);
     GPIOPadConfigSet(DRV_NFAULT_PORT, DRV_NFAULT_PIN,
                      GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
     s_nfault_gpio_ok = true;
+#else
+    s_nfault_gpio_ok = false;
+#endif
 }
 
 bool motor_driver_hardware_fault_active(void)
 {
+#if !MOTOR_ENABLE_NFAULT_MONITORING
+    return false;
+#else
     if (!s_nfault_gpio_ok)
     {
         return false;
     }
     return (GPIOPinRead(DRV_NFAULT_PORT, DRV_NFAULT_PIN) & DRV_NFAULT_PIN) == 0;
+#endif
+}
+
+bool motor_driver_try_clear_hardware_fault(void)
+{
+    prvMotorLibTaskEnter();
+    disableMotor();
+    prvMotorLibTaskExit();
+    prvMotorLibTaskEnter();
+    enableMotor();
+    disableMotor();
+    prvMotorLibTaskExit();
+    return !motor_driver_hardware_fault_active();
 }
 
 void motor_driver_init(void)

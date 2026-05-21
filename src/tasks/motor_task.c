@@ -220,6 +220,8 @@ static void prvMotorTask(void *pvParameters)
                 pwm_duty = 0;
                 state = MOTOR_STATE_IDLE;
                 motor_driver_estop();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                (void)motor_driver_try_clear_hardware_fault();
             }
         }
 
@@ -253,25 +255,34 @@ static void prvMotorTask(void *pvParameters)
         case MOTOR_STATE_IDLE:
             g_motor_estop_armed = false;
             brake_ticks = 0;
-            if ((evt & EVT_USER_START) && !motor_driver_hardware_fault_active())
+            if (evt & EVT_USER_START)
             {
+                if (motor_driver_hardware_fault_active())
+                {
+                    (void)motor_driver_try_clear_hardware_fault();
+                }
                 if (rpm_desired < MIN_START_RPM)
                 {
                     rpm_desired = MIN_START_RPM;
                 }
-                g_motor_estop_armed = true;
-                state = MOTOR_STATE_STARTING;
-            }
-            else if ((evt & EVT_USER_START) &&
-                     motor_driver_hardware_fault_active())
-            {
-                fault_bits |= EVT_ESTOP_DRIVER;
-                state = MOTOR_STATE_FAULT_LATCHED;
+#if MOTOR_ENABLE_NFAULT_MONITORING && MOTOR_NFAULT_BLOCKS_START
+                if (!motor_driver_hardware_fault_active() &&
+                    motor_driver_is_ready())
+#else
+                if (motor_driver_is_ready())
+#endif
+                {
+                    state = MOTOR_STATE_STARTING;
+                }
+                else if (motor_driver_hardware_fault_active())
+                {
+                    fault_bits |= EVT_ESTOP_DRIVER;
+                }
             }
             break;
 
         case MOTOR_STATE_STARTING:
-            g_motor_estop_armed = true;
+            g_motor_estop_armed = false;
             if (rpm_desired <= 0)             state = MOTOR_STATE_IDLE;
             if (rpm_actual > 100)             state = MOTOR_STATE_RUNNING;
             if (evt & EVT_USER_STOP)          state = MOTOR_STATE_IDLE;

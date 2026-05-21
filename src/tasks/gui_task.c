@@ -649,6 +649,14 @@ static void OnStartPressed(tWidget *psWidget)
     prvSendLatestRpmCommand(rpm);
     xEventGroupClearBits(xSystemEvents, EVT_USER_STOP);
     xEventGroupSetBits(xSystemEvents, EVT_USER_START);
+#if MOTOR_ENABLE_NFAULT_MONITORING
+    if (g_ui32Panel == 0 && (g_fault_bits & EVT_ESTOP_DRIVER))
+    {
+        CanvasTextSet(&g_sPowerLimitText,
+                      (char *)"Drv fault - power-cycle motor board");
+        WidgetPaint((tWidget *)&g_sPowerLimitText);
+    }
+#endif
 }
 
 static void OnStopPressed(tWidget *psWidget)
@@ -774,10 +782,10 @@ static void prvRefreshControlStatusLine(void)
     }
     else if (g_fault_bits & EVT_ESTOP_ANY)
     {
-        if (g_state == MOTOR_STATE_IDLE &&
-            (g_fault_bits & EVT_ESTOP_DRIVER) == EVT_ESTOP_DRIVER)
+        if (g_state == MOTOR_STATE_IDLE && (g_fault_bits & EVT_ESTOP_DRIVER))
         {
-            usprintf(s_status_line_buf, "Idle - clear Drv fault to START");
+            usprintf(s_status_line_buf,
+                     "Idle - Drv fault: cycle motor power");
         }
         else
         {

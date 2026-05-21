@@ -159,6 +159,18 @@ extern volatile bool g_motor_estop_armed;
 /* Minimum RPM applied when START is pressed with the slider at 0%. */
 #define MIN_START_RPM              500
 
+/* Poll DRV8323 nFAULT on PL0 (active low). Set to 1 only after the motor-board
+ * red LED / nFAULT line is confirmed on your adapter — see motorlib_example
+ * motor_pinmap.h (default there is 0 to avoid a floating pin blocking START). */
+#ifndef MOTOR_ENABLE_NFAULT_MONITORING
+#define MOTOR_ENABLE_NFAULT_MONITORING  0
+#endif
+
+/* When monitoring is on: if 1, START is refused while nFAULT is low. */
+#ifndef MOTOR_NFAULT_BLOCKS_START
+#define MOTOR_NFAULT_BLOCKS_START  1
+#endif
+
 /* Motor ramp limits (assignment 2.1.3) */
 #define ACCEL_LIMIT_RPMPS          500
 #define DECEL_LIMIT_RPMPS          500

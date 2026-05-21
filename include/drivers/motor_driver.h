@@ -25,5 +25,7 @@ MotorState_t  motor_driver_get_state(void);
 bool          motor_driver_is_ready(void);
 /* True when DRV8323 nFAULT is asserted (active low; red LED on motor board). */
 bool          motor_driver_hardware_fault_active(void);
+/* Toggle disable/enable; some DRV8323 faults clear when nFAULT releases. */
+bool          motor_driver_try_clear_hardware_fault(void);
 
 #endif /* MOTOR_DRIVER_H */
