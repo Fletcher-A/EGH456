@@ -44,6 +44,9 @@ typedef struct
     uint16_t   pwm_duty;
     float      power_watts;        /* filtered motor power (W) */
     MotorState_t state;
+    EventBits_t fault_bits;        /* latched EVT_ESTOP_* reason bits */
+    uint8_t    hall_state;         /* bit2=A, bit1=B, bit0=C */
+    bool       motor_ready;
 } MotorMsgObj;
 
 typedef struct
@@ -92,6 +95,7 @@ typedef struct
 extern EventGroupHandle_t xSystemEvents;
 extern SemaphoreHandle_t  xUARTMutex;
 extern SemaphoreHandle_t  xI2CMutex;       /* shared I2C bus mutex */
+extern SemaphoreHandle_t  xCommandMutex;
 
 /*-----------------------------------------------------------*/
 /* Event-group bits */
@@ -100,7 +104,9 @@ extern SemaphoreHandle_t  xI2CMutex;       /* shared I2C bus mutex */
 #define EVT_ESTOP_POWER          (1 << 0)   /* motor power threshold */
 #define EVT_ESTOP_ACCEL          (1 << 1)   /* IMU accel threshold */
 #define EVT_ESTOP_DISTANCE       (1 << 2)   /* ToF threshold */
-#define EVT_ESTOP_ANY            (EVT_ESTOP_POWER | EVT_ESTOP_ACCEL | EVT_ESTOP_DISTANCE)
+#define EVT_ESTOP_DRIVER         (1 << 3)   /* DRV8323 nFAULT (red LED on motor board) */
+#define EVT_ESTOP_ANY            (EVT_ESTOP_POWER | EVT_ESTOP_ACCEL | \
+                                  EVT_ESTOP_DISTANCE | EVT_ESTOP_DRIVER)
 
 /* Status / sensor flags */
 #define EVT_NIGHT_DETECTED       (1 << 4)
@@ -127,6 +133,11 @@ extern SemaphoreHandle_t  xI2CMutex;       /* shared I2C bus mutex */
 extern volatile float g_thresh_power_w;
 extern volatile float g_thresh_accel_g;
 extern volatile float g_thresh_distance_mm;
+
+extern volatile bool g_motor_estop_armed;
+
+/* Minimum RPM applied when START is pressed with the slider at 0%. */
+#define MIN_START_RPM              500
 
 /* Motor ramp limits (assignment 2.1.3) */
 #define ACCEL_LIMIT_RPMPS          500

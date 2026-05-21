@@ -19,8 +19,10 @@
 #include "driver_lib/gpio.h"
 #include "driver_lib/sysctl.h"
 #include "driver_lib/interrupt.h"
+#include "FreeRTOSConfig.h"
 
 #include "drivers/speed_sensor.h"
+#include "drivers/motor_driver.h"
 
 /*-----------------------------------------------------------*/
 /* Pin assignments. Tune for the BoosterPack you have. */
@@ -41,9 +43,36 @@
 
 /*-----------------------------------------------------------*/
 
-static volatile uint32_t g_edges = 0;     /* incremented by every hall ISR */
+static volatile uint32_t g_edges = 0;     /* hall sector changes per tick window */
 static volatile int32_t  g_rpm_raw  = 0;
 static volatile int32_t  g_rpm_filt = 0;
+static uint8_t           s_hall_prev = 0xFF;  /* force first sample to count */
+
+/*-----------------------------------------------------------*/
+
+/* Count one edge per valid commutation step (6 per electrical revolution),
+ * not every GPIO toggle. BOTH_EDGE on three lines over-counts and inflates
+ * RPM (e.g. fixed ~6000+ on the GUI while the slider targets 0..4000). */
+static void prvHallSectorChanged(void)
+{
+    bool ha, hb, hc;
+    bool count_edge = false;
+
+    IntMasterDisable();
+    speed_sensor_read_halls(&ha, &hb, &hc);
+    uint8_t hall = (uint8_t)((ha ? 4u : 0u) | (hb ? 2u : 0u) | (hc ? 1u : 0u));
+
+    if (hall != s_hall_prev && hall != 0u && hall != 7u)
+    {
+        g_edges++;
+        s_hall_prev = hall;
+        count_edge = true;
+    }
+    IntMasterEnable();
+
+    (void)count_edge;
+    motor_driver_update_commutation();
+}
 
 /*-----------------------------------------------------------*/
 
@@ -66,7 +95,7 @@ void speed_sensor_init(void)
     GPIOPadConfigSet(HALL_B_PORT, HALL_B_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
     GPIOPadConfigSet(HALL_C_PORT, HALL_C_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
 
-    /* Interrupt on BOTH edges so we get six counts per electrical rev. */
+    /* Any hall transition runs prvHallSectorChanged (counts valid 1..6 only). */
     GPIOIntTypeSet(HALL_A_PORT, HALL_A_PIN, GPIO_BOTH_EDGES);
     GPIOIntTypeSet(HALL_B_PORT, HALL_B_PIN, GPIO_BOTH_EDGES);
     GPIOIntTypeSet(HALL_C_PORT, HALL_C_PIN, GPIO_BOTH_EDGES);
@@ -79,9 +108,28 @@ void speed_sensor_init(void)
     GPIOIntEnable(HALL_B_PORT, HALL_B_PIN);
     GPIOIntEnable(HALL_C_PORT, HALL_C_PIN);
 
+    /* Priority must be >= configMAX_SYSCALL_INTERRUPT_PRIORITY (5 on this
+     * port) if ISRs ever call FromISR APIs.  Use 6–7 so hall ISRs do not
+     * preempt MotorLib calls in motor_task that run with IntMasterEnable. */
+    IntPrioritySet(HALL_A_INT_VEC, configMAX_SYSCALL_INTERRUPT_PRIORITY + 1);
+    IntPrioritySet(HALL_B_INT_VEC, configMAX_SYSCALL_INTERRUPT_PRIORITY + 1);
+    IntPrioritySet(HALL_C_INT_VEC, configMAX_SYSCALL_INTERRUPT_PRIORITY + 1);
+
     IntEnable(HALL_A_INT_VEC);
     IntEnable(HALL_B_INT_VEC);
     IntEnable(HALL_C_INT_VEC);
+
+    s_hall_prev = 0xFF;
+}
+
+void speed_sensor_read_halls(bool *ha, bool *hb, bool *hc)
+{
+    if (ha)
+        *ha = (GPIOPinRead(HALL_A_PORT, HALL_A_PIN) & HALL_A_PIN) != 0;
+    if (hb)
+        *hb = (GPIOPinRead(HALL_B_PORT, HALL_B_PIN) & HALL_B_PIN) != 0;
+    if (hc)
+        *hc = (GPIOPinRead(HALL_C_PORT, HALL_C_PIN) & HALL_C_PIN) != 0;
 }
 
 /*-----------------------------------------------------------*/
@@ -90,19 +138,19 @@ void speed_sensor_init(void)
 void HallPortMIntHandler(void)
 {
     GPIOIntClear(HALL_A_PORT, HALL_A_PIN);
-    g_edges++;
+    prvHallSectorChanged();
 }
 
 void HallPortHIntHandler(void)
 {
     GPIOIntClear(HALL_B_PORT, HALL_B_PIN);
-    g_edges++;
+    prvHallSectorChanged();
 }
 
 void HallPortNIntHandler(void)
 {
     GPIOIntClear(HALL_C_PORT, HALL_C_PIN);
-    g_edges++;
+    prvHallSectorChanged();
 }
 
 /*-----------------------------------------------------------*/
@@ -126,7 +174,20 @@ void speed_sensor_tick(uint32_t period_ms)
      * alpha = 1/4 gives a ~40 ms time constant at 100 Hz —
      * smooths quantisation noise on slow rotation without
      * adding noticeable lag. */
+    if (rpm_raw > 4000)
+    {
+        rpm_raw = 4000;
+    }
+
     g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 2);
+    if (g_rpm_filt > 4000)
+    {
+        g_rpm_filt = 4000;
+    }
+    else if (g_rpm_filt < 0)
+    {
+        g_rpm_filt = 0;
+    }
     g_rpm_raw  = rpm_raw;
 }
 

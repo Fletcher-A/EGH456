@@ -26,6 +26,7 @@
 #include "driverlib/uart.h"
 #include "driverlib/fpu.h"
 #include "drivers/rtos_hw_drivers.h"
+#include "drivers/motor_driver.h"
 #include "utils/uartstdio.h"
 #include "shared.h"
 /*-----------------------------------------------------------*/
@@ -45,9 +46,11 @@ QueueHandle_t      xAccelRawQueue = NULL;
 volatile float g_thresh_power_w      = DEFAULT_POWER_LIMIT_W;
 volatile float g_thresh_accel_g      = DEFAULT_ACCEL_LIMIT_G;
 volatile float g_thresh_distance_mm  = DEFAULT_DISTANCE_LIMIT_MM;
+volatile bool  g_motor_estop_armed   = false;
 EventGroupHandle_t xSystemEvents  = NULL;
 SemaphoreHandle_t  xUARTMutex     = NULL;
 SemaphoreHandle_t  xI2CMutex      = NULL;
+SemaphoreHandle_t  xCommandMutex  = NULL;
 
 /* Task creators (defined in their own .c files). */
 extern void vCreateMotorTask(void);
@@ -65,7 +68,7 @@ int main(void)
     prvSetupHardware();
 
     /* Create RTOS objects. */
-    xMotorQueue    = xQueueCreate(8, sizeof(MotorMsgObj));
+    xMotorQueue    = xQueueCreate(16, sizeof(MotorMsgObj));
     xSensorQueue   = xQueueCreate(8, sizeof(SensorMsgObj));
     xCommandQueue  = xQueueCreate(4, sizeof(int32_t));   /* desired RPM commands */
     xPowerRawQueue = xQueueCreate(64, sizeof(PowerSampleRaw_t)); /* ADC ISR -> sensor */
@@ -73,10 +76,11 @@ int main(void)
     xSystemEvents  = xEventGroupCreate();
     xUARTMutex     = xSemaphoreCreateMutex();
     xI2CMutex      = xSemaphoreCreateMutex();
+    xCommandMutex  = xSemaphoreCreateMutex();
 
     if (!xMotorQueue || !xSensorQueue || !xCommandQueue ||
         !xPowerRawQueue || !xAccelRawQueue ||
-        !xSystemEvents || !xUARTMutex  || !xI2CMutex)
+        !xSystemEvents || !xUARTMutex  || !xI2CMutex || !xCommandMutex)
     {
         for (;;) {}     /* RTOS object creation failed */
     }
@@ -109,6 +113,7 @@ static void prvSetupHardware(void)
     PinoutSet(false, false);
 
     prvConfigureUART();
+    motor_driver_init();
     /* I2C0 is set up by the sensor task (via initI2C in i2cOptDriver).
      * LCD/touch SPI is set up by the GUI task (Kentec...Init,
      * TouchScreenInit). LaunchPad buttons aren't used — input is via

@@ -25,15 +25,14 @@
  * PUBLIC FUNCTIONS (called from elsewhere):
  *   vCreateMotorTask()   — called once from main.c during startup
  *
- * SIMULATION NOTES
- * ----------------
+ * CONTROL NOTES
+ * -------------
  *   - State machine: Idle / Starting / Running / E-Stop Braking /
  *                    Fault Latched (assignment 2.1.1 spec).
  *   - Reference RPM ramps to desired at 500 RPM/s (1000 in E-Stop).
- *   - Actual RPM lags the reference (first-order, simulating a PI).
- *   - Power = RPM * 0.04 with a low-pass filter.
- *   When the motor team wires real MotorLib + hall sensors + ADC,
- *   the simulation block (steps 3-6) gets replaced.
+ *   - Actual RPM comes from hall-sensor feedback.
+ *   - Duty is adjusted from reference RPM plus measured speed error.
+ *   - Power is still estimated until the DRV8323 ADC power pipeline is enabled.
  */
 
 #include <stdint.h>
@@ -41,15 +40,85 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+#include "semphr.h"
 #include "event_groups.h"
 #include "shared.h"
+#include "drivers/motor_driver.h"
 #include "drivers/speed_sensor.h"
+#include "utils/uart_log.h"
 /*-----------------------------------------------------------*/
 
-#define LOOP_PERIOD_MS  50          /* 20 Hz control / publish */
+static void prvMotorDriverOnStateChange(MotorState_t prev, MotorState_t now)
+{
+    if (now == prev)
+    {
+        return;
+    }
+    if (now == MOTOR_STATE_IDLE)
+    {
+        motor_driver_stop(false);
+    }
+    else if (now == MOTOR_STATE_STARTING && prev == MOTOR_STATE_IDLE)
+    {
+        motor_driver_start();
+    }
+    else if (now == MOTOR_STATE_ESTOP_BRAKING ||
+             now == MOTOR_STATE_FAULT_LATCHED)
+    {
+        motor_driver_estop();
+    }
+}
+
+#define LOOP_PERIOD_MS  10          /* 100 Hz control; assignment requires 1-10 ms */
 #define SPEED_TICK_MS   10          /* 100 Hz hall-edge-count -> RPM */
 #define ACCEL_PER_TICK  ((ACCEL_LIMIT_RPMPS * LOOP_PERIOD_MS) / 1000)   /* 25 RPM */
 #define ESTOP_PER_TICK  ((ESTOP_DECEL_LIMIT_RPMPS * LOOP_PERIOD_MS) / 1000) /* 50 RPM */
+#define MAX_COMMAND_RPM 4000
+/* Force Fault Latched if braking does not report 0 RPM (hall noise). */
+#define ESTOP_BRAKE_FAULT_TICKS  100u   /* 1 s at 10 ms loop */
+
+static void prvClearFaultLatch(void)
+{
+    xEventGroupClearBits(xSystemEvents,
+                         EVT_ESTOP_ANY | EVT_USER_START | EVT_USER_STOP);
+    g_motor_estop_armed = false;
+}
+
+/* DRV8323 nFAULT (red LED on green motor board) is not wired into xSystemEvents. */
+static void prvHandleHardwareDriverFault(MotorState_t *pState,
+                                         EventBits_t *pFaultBits,
+                                         uint16_t *pBrakeTicks)
+{
+    if (!motor_driver_hardware_fault_active())
+    {
+        *pFaultBits &= ~EVT_ESTOP_DRIVER;
+        return;
+    }
+
+    *pFaultBits |= EVT_ESTOP_DRIVER;
+    g_motor_estop_armed = false;
+
+    if (*pState == MOTOR_STATE_STARTING || *pState == MOTOR_STATE_RUNNING)
+    {
+        *pBrakeTicks = 0;
+        *pState = MOTOR_STATE_ESTOP_BRAKING;
+    }
+    /* Idle / Fault Latched / E-Stop Braking: do not re-latch here; ACK and
+     * braking logic own those transitions. START is blocked while nFAULT low. */
+}
+
+static int32_t prvClampRpmCommand(int32_t rpm)
+{
+    if (rpm < 0)
+    {
+        return 0;
+    }
+    if (rpm > MAX_COMMAND_RPM)
+    {
+        return MAX_COMMAND_RPM;
+    }
+    return rpm;
+}
 
 /* Dedicated 100 Hz speed task — converts accumulated hall-edge counts
  * into RPM at the rate the spec mandates. Kept separate from
@@ -58,7 +127,6 @@
 static void prvSpeedTask(void *pvParameters)
 {
     (void)pvParameters;
-    speed_sensor_init();
     TickType_t xLastWake = xTaskGetTickCount();
     for (;;)
     {
@@ -78,6 +146,8 @@ static void prvMotorTask(void *pvParameters)
     uint16_t     pwm_duty      = 0;
     float        power_w       = 0.0f;
     uint32_t     seq           = 0;
+    EventBits_t  fault_bits    = 0;
+    uint16_t     brake_ticks   = 0;
 
     TickType_t   xLastWake = xTaskGetTickCount();
 
@@ -87,11 +157,26 @@ static void prvMotorTask(void *pvParameters)
 
         /* --- 1. Read commands ------------------------------------- */
         int32_t newRpm;
-        if (xQueueReceive(xCommandQueue, &newRpm, 0) == pdPASS)
+        if (xCommandMutex != NULL)
         {
-            /* GUI can change the desired RPM at any time, but the
+            xSemaphoreTake(xCommandMutex, portMAX_DELAY);
+        }
+        while (xQueueReceive(xCommandQueue, &newRpm, 0) == pdPASS)
+        {
+            /* GUI can change the desired RPM at any time. Drain the queue
+             * so the motor always follows the most recent slider/start value;
              * state machine decides if/when it's actually applied. */
-            rpm_desired = newRpm;
+            rpm_desired = prvClampRpmCommand(newRpm);
+            /* Slider must change motor torque immediately, not via the
+             * 500 RPM/s reference ramp (that only updates the display target). */
+            if (state == MOTOR_STATE_STARTING || state == MOTOR_STATE_RUNNING)
+            {
+                rpm_reference = rpm_desired;
+            }
+        }
+        if (xCommandMutex != NULL)
+        {
+            xSemaphoreGive(xCommandMutex);
         }
 
         EventBits_t evt = xEventGroupWaitBits(
@@ -101,33 +186,137 @@ static void prvMotorTask(void *pvParameters)
             pdTRUE,       /* clear on read */
             pdFALSE,      /* any bit */
             0);           /* don't block */
+        if (evt & EVT_USER_STOP)
+        {
+            rpm_desired = 0;
+            rpm_reference = 0;
+            pwm_duty = 0;
+            state = MOTOR_STATE_IDLE;
+            prvClearFaultLatch();
+            fault_bits = 0;
+            brake_ticks = 0;
+            motor_driver_estop();
+            if (xCommandMutex != NULL)
+            {
+                xSemaphoreTake(xCommandMutex, portMAX_DELAY);
+                xQueueReset(xCommandQueue);
+                xSemaphoreGive(xCommandMutex);
+            }
+        }
+
+        if (evt & EVT_USER_ESTOP_ACK)
+        {
+            /* ACK clears the latched fault state. Hardware nFAULT may still be
+             * active (red LED): user returns to Idle but START stays blocked
+             * until the driver fault clears. */
+            if (state == MOTOR_STATE_ESTOP_BRAKING ||
+                state == MOTOR_STATE_FAULT_LATCHED)
+            {
+                prvClearFaultLatch();
+                fault_bits = 0;
+                brake_ticks = 0;
+                rpm_desired = 0;
+                rpm_reference = 0;
+                pwm_duty = 0;
+                state = MOTOR_STATE_IDLE;
+                motor_driver_estop();
+            }
+        }
+
+        EventBits_t active_faults = evt & EVT_ESTOP_ANY;
+        if (active_faults && !(evt & EVT_USER_ESTOP_ACK))
+        {
+            fault_bits |= active_faults;
+        }
+        rpm_actual = motor_driver_get_rpm();
+        if (rpm_actual < 0)
+        {
+            rpm_actual = 0;
+        }
+        if (rpm_actual > MAX_COMMAND_RPM)
+        {
+            rpm_actual = MAX_COMMAND_RPM;
+        }
+        bool hall_a, hall_b, hall_c;
+        speed_sensor_read_halls(&hall_a, &hall_b, &hall_c);
+        uint8_t hall_state = (hall_a ? 4u : 0u) |
+                             (hall_b ? 2u : 0u) |
+                             (hall_c ? 1u : 0u);
+
+        prvHandleHardwareDriverFault(&state, &fault_bits, &brake_ticks);
+
+        MotorState_t prev_state = state;
 
         /* --- 2. State transitions --------------------------------- */
         switch (state)
         {
         case MOTOR_STATE_IDLE:
-            if (evt & EVT_USER_START)        state = MOTOR_STATE_STARTING;
+            g_motor_estop_armed = false;
+            brake_ticks = 0;
+            if ((evt & EVT_USER_START) && !motor_driver_hardware_fault_active())
+            {
+                if (rpm_desired < MIN_START_RPM)
+                {
+                    rpm_desired = MIN_START_RPM;
+                }
+                g_motor_estop_armed = true;
+                state = MOTOR_STATE_STARTING;
+            }
+            else if ((evt & EVT_USER_START) &&
+                     motor_driver_hardware_fault_active())
+            {
+                fault_bits |= EVT_ESTOP_DRIVER;
+                state = MOTOR_STATE_FAULT_LATCHED;
+            }
             break;
 
         case MOTOR_STATE_STARTING:
+            g_motor_estop_armed = true;
+            if (rpm_desired <= 0)             state = MOTOR_STATE_IDLE;
             if (rpm_actual > 100)             state = MOTOR_STATE_RUNNING;
             if (evt & EVT_USER_STOP)          state = MOTOR_STATE_IDLE;
-            if (evt & EVT_ESTOP_ANY)          state = MOTOR_STATE_ESTOP_BRAKING;
+            if (active_faults)
+            {
+                brake_ticks = 0;
+                state = MOTOR_STATE_ESTOP_BRAKING;
+            }
             break;
 
         case MOTOR_STATE_RUNNING:
+            g_motor_estop_armed = true;
+            if (rpm_desired <= 0)             state = MOTOR_STATE_IDLE;
             if (evt & EVT_USER_STOP)          state = MOTOR_STATE_IDLE;
-            if (evt & EVT_ESTOP_ANY)          state = MOTOR_STATE_ESTOP_BRAKING;
+            if (active_faults)
+            {
+                brake_ticks = 0;
+                state = MOTOR_STATE_ESTOP_BRAKING;
+            }
             break;
 
         case MOTOR_STATE_ESTOP_BRAKING:
-            if (rpm_actual == 0)              state = MOTOR_STATE_FAULT_LATCHED;
+            g_motor_estop_armed = false;
+            brake_ticks++;
+            if (rpm_actual <= 0 ||
+                brake_ticks >= ESTOP_BRAKE_FAULT_TICKS)
+            {
+                state = MOTOR_STATE_FAULT_LATCHED;
+            }
             break;
 
         case MOTOR_STATE_FAULT_LATCHED:
-            if (evt & EVT_USER_ESTOP_ACK)     state = MOTOR_STATE_IDLE;
+            g_motor_estop_armed = false;
             break;
         }
+
+        if (state == MOTOR_STATE_IDLE && (evt & EVT_USER_STOP))
+        {
+            rpm_desired = 0;
+            rpm_reference = 0;
+            pwm_duty = 0;
+            g_motor_estop_armed = false;
+        }
+
+        prvMotorDriverOnStateChange(prev_state, state);
 
         /* --- 3. Ramp reference toward target ---------------------- */
         int32_t target;
@@ -159,11 +348,21 @@ static void prvMotorTask(void *pvParameters)
             if (rpm_reference < target) rpm_reference = target;
         }
 
-        /* --- 4. "PI" — first-order lag on the reference ----------- */
-        rpm_actual += (rpm_reference - rpm_actual) / 8;
-
-        /* --- 5. Fake duty from actual RPM (0..4000 -> 0..100 %) --- */
-        pwm_duty = (uint16_t)((rpm_actual * 100) / 4000);
+        /* --- 4. Open-loop duty from slider (rpm_desired -> PWM us). -----
+         * Hall RPM is displayed only; do not zero duty on "overspeed" or the
+         * motor coasts at one speed while the GUI target changes. */
+        if (state == MOTOR_STATE_IDLE ||
+            state == MOTOR_STATE_FAULT_LATCHED ||
+            state == MOTOR_STATE_ESTOP_BRAKING)
+        {
+            motor_driver_set_speed_rpm(0);
+            pwm_duty = 0;
+        }
+        else
+        {
+            motor_driver_set_speed_rpm(rpm_desired);
+            pwm_duty = motor_driver_get_duty_percent();
+        }
 
         /* --- 6. Fake power from RPM, low-pass filtered ----------- *
          * Real version will use V*I_total from the DRV8323 ADC.    */
@@ -180,7 +379,25 @@ static void prvMotorTask(void *pvParameters)
         msg.pwm_duty      = pwm_duty;
         msg.power_watts   = power_w;
         msg.state         = state;
-        xQueueSend(xMotorQueue, &msg, 0);
+        msg.fault_bits    = fault_bits;
+        msg.hall_state    = hall_state;
+        msg.motor_ready   = motor_driver_is_ready();
+        xQueueSend(xMotorQueue, &msg, pdMS_TO_TICKS(1));
+
+        if ((seq % 100u) == 0u)
+        {
+            uart_log_printf("MOTOR st=%d des=%d ref=%d rpm=%d duty=%u hall=%u%u%u ready=%u fault=0x%x\n",
+                            (int)state,
+                            (int)rpm_desired,
+                            (int)rpm_reference,
+                            (int)rpm_actual,
+                            (unsigned)pwm_duty,
+                            hall_a ? 1u : 0u,
+                            hall_b ? 1u : 0u,
+                            hall_c ? 1u : 0u,
+                            motor_driver_is_ready() ? 1u : 0u,
+                            (unsigned)fault_bits);
+        }
     }
 }
 
@@ -193,11 +410,8 @@ void vCreateMotorTask(void)
     xTaskCreate(prvMotorTask, "Motor",
                 configMINIMAL_STACK_SIZE * 4, NULL,
                 tskIDLE_PRIORITY + 4, NULL);
-    /* Speed task — DISABLED until the hall sensors are wired. Calling
-     * speed_sensor_init() configures GPIO interrupts on PM3/PH2/PN2,
-     * which will fire spuriously if the hall lines float. Re-enable
-     * once the motor BoosterPack is plugged in. */
-    // xTaskCreate(prvSpeedTask, "Speed",
-    //             configMINIMAL_STACK_SIZE * 2, NULL,
-    //             tskIDLE_PRIORITY + 5, NULL);
+    /* 100 Hz hall edge -> RPM filter (requires DRV8323 + motor connected). */
+    xTaskCreate(prvSpeedTask, "Speed",
+                configMINIMAL_STACK_SIZE * 2, NULL,
+                tskIDLE_PRIORITY + 5, NULL);
 }

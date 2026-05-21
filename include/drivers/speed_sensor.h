@@ -23,10 +23,12 @@
 #define SPEED_SENSOR_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define SPEED_EDGES_PER_REV     24      /* 6 * pole_pairs */
 
 void    speed_sensor_init(void);
+void    speed_sensor_read_halls(bool *ha, bool *hb, bool *hc);
 int32_t speed_sensor_get_rpm(void);          /* latest filtered RPM */
 int32_t speed_sensor_get_rpm_raw(void);      /* most recent un-filtered RPM */
 void    speed_sensor_tick(uint32_t period_ms);

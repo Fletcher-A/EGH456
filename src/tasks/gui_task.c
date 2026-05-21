@@ -76,6 +76,7 @@
 #include "images.h"
 
 #include "shared.h"
+#include "utils/uart_log.h"
 /*-----------------------------------------------------------*/
 
 extern uint32_t g_ui32SysClock;
@@ -96,8 +97,12 @@ static tDMAControlTable s_DMAControlTable[64] __attribute__ ((aligned(1024)));
 
 static MotorState_t g_state           = MOTOR_STATE_IDLE;
 static int32_t      g_rpm_actual      = 0;
+static int32_t      g_rpm_desired     = 0;
 static uint16_t     g_pwm_duty        = 0;
 static float        g_power_w         = 0.0f;
+static EventBits_t  g_fault_bits      = 0;
+static uint8_t      g_hall_state      = 0;
+static bool         g_motor_ready     = false;
 static float        g_light_lux       = 0.0f;
 static float        g_accel_g         = 0.0f;   /* filtered Y, used by plot */
 static float        g_accel_x_g       = 0.0f;
@@ -608,15 +613,49 @@ static void prvSwapPanel(uint32_t idx)
 /*-----------------------------------------------------------*/
 /* Button callbacks — send signals to the motor task. */
 
+static void prvSendLatestRpmCommand(int32_t rpm)
+{
+    /* Slider callbacks can generate several commands before the motor task
+     * drains the queue. Keep only the newest command so START cannot be
+     * paired with an old 0 RPM command. */
+    if (xCommandMutex != NULL)
+    {
+        xSemaphoreTake(xCommandMutex, portMAX_DELAY);
+    }
+    xQueueReset(xCommandQueue);
+    xQueueSend(xCommandQueue, &rpm, 0);
+    if (xCommandMutex != NULL)
+    {
+        xSemaphoreGive(xCommandMutex);
+    }
+}
+
 static void OnStartPressed(tWidget *psWidget)
 {
     (void)psWidget;
+    int32_t pct = g_sSpeedSlider.i32Value;
+    int32_t rpm = (pct * 4000) / 100;
+    /* Slider defaults to 0%; motor task only leaves Idle when desired RPM > 0. */
+    if (rpm < MIN_START_RPM)
+    {
+        rpm = MIN_START_RPM;
+        pct = (rpm * 100) / 4000;
+        SliderValueSet(&g_sSpeedSlider, pct);
+        static char buf[20];
+        usprintf(buf, "Speed %d%%", (int)pct);
+        SliderTextSet(&g_sSpeedSlider, buf);
+        WidgetPaint((tWidget *)&g_sSpeedSlider);
+    }
+    prvSendLatestRpmCommand(rpm);
+    xEventGroupClearBits(xSystemEvents, EVT_USER_STOP);
     xEventGroupSetBits(xSystemEvents, EVT_USER_START);
 }
 
 static void OnStopPressed(tWidget *psWidget)
 {
     (void)psWidget;
+    int32_t rpm = 0;
+    prvSendLatestRpmCommand(rpm);
     xEventGroupSetBits(xSystemEvents, EVT_USER_STOP);
 }
 
@@ -632,7 +671,7 @@ static void OnSpeedSliderChange(tWidget *psWidget, int32_t i32Value)
     /* Slider 0..100 % -> 0..4000 RPM. The motor task picks up the
      * new desired RPM via the command queue and ramps to it. */
     int32_t rpm = (i32Value * 4000) / 100;
-    xQueueSend(xCommandQueue, &rpm, 0);
+    prvSendLatestRpmCommand(rpm);
 
     static char buf[20];
     usprintf(buf, "Speed %d%%", i32Value);
@@ -686,6 +725,83 @@ static void prvRefreshControlThreshLine(void)
      * would land on whatever panel is currently mounted. */
     if (g_ui32Panel == 0)
         WidgetPaint((tWidget *)&g_sPowerLimitText);
+}
+
+/* Control-tab status line under thresholds (fault text, duty debug, etc.). */
+static char s_status_line_buf[48];
+
+static void prvFormatEstopReasons(char *buf, EventBits_t bits)
+{
+    usprintf(buf, "EStop:%s%s%s%s  Press ACK",
+             (bits & EVT_ESTOP_POWER)    ? " Pwr" : "",
+             (bits & EVT_ESTOP_ACCEL)    ? " Acc" : "",
+             (bits & EVT_ESTOP_DISTANCE) ? " Dst" : "",
+             (bits & EVT_ESTOP_DRIVER)   ? " Drv" : "");
+}
+
+static void prvRefreshControlStatusLine(void)
+{
+    if (g_ui32Panel != 0)
+    {
+        return;
+    }
+
+    if (g_state == MOTOR_STATE_FAULT_LATCHED)
+    {
+        if (g_fault_bits & EVT_ESTOP_ANY)
+        {
+            prvFormatEstopReasons(s_status_line_buf, g_fault_bits);
+        }
+        else
+        {
+            usprintf(s_status_line_buf, "Fault latched - press ACK");
+        }
+    }
+    else if (g_state == MOTOR_STATE_ESTOP_BRAKING)
+    {
+        if (g_fault_bits & EVT_ESTOP_ANY)
+        {
+            prvFormatEstopReasons(s_status_line_buf, g_fault_bits);
+        }
+        else
+        {
+            usprintf(s_status_line_buf, "E-Stop braking - press ACK");
+        }
+    }
+    else if (g_fault_bits & EVT_SENSOR_FAULT)
+    {
+        usprintf(s_status_line_buf, "Fault: MotorLib init failed");
+    }
+    else if (g_fault_bits & EVT_ESTOP_ANY)
+    {
+        if (g_state == MOTOR_STATE_IDLE &&
+            (g_fault_bits & EVT_ESTOP_DRIVER) == EVT_ESTOP_DRIVER)
+        {
+            usprintf(s_status_line_buf, "Idle - clear Drv fault to START");
+        }
+        else
+        {
+            prvFormatEstopReasons(s_status_line_buf, g_fault_bits);
+        }
+    }
+    else if (g_state == MOTOR_STATE_STARTING ||
+             g_state == MOTOR_STATE_RUNNING)
+    {
+        usprintf(s_status_line_buf, "Duty %d%% Ready %d Hall %d%d%d",
+                 (int)g_pwm_duty,
+                 g_motor_ready ? 1 : 0,
+                 (g_hall_state & 4u) ? 1 : 0,
+                 (g_hall_state & 2u) ? 1 : 0,
+                 (g_hall_state & 1u) ? 1 : 0);
+    }
+    else
+    {
+        prvRefreshControlThreshLine();
+        return;
+    }
+
+    CanvasTextSet(&g_sPowerLimitText, s_status_line_buf);
+    WidgetPaint((tWidget *)&g_sPowerLimitText);
 }
 
 static void OnPowerInc(tWidget *w) { (void)w;
@@ -742,6 +858,7 @@ static void prvRedrawWidgets(void)
      * panel paints over the cleared area. */
     static MotorState_t last_state    = (MotorState_t)-1;
     static int32_t      last_rpm      = -1;
+    static int32_t      last_rpm_des  = -1;
     static int32_t      last_pwr_int  = -1;
     static bool         last_is_night = false;
     static int          last_lux_int  = -10000;
@@ -752,6 +869,7 @@ static void prvRedrawWidgets(void)
     static int          last_temp_10  = -100000;
     static int          last_hum_10   = -100000;
     static int          last_pres_10  = -100000;
+    static EventBits_t  last_fault_bits = (EventBits_t)-1;
 
     /* Plots tab repaints itself via OnPlotCanvasPaint. */
     if (g_ui32Panel == 1) return;
@@ -760,6 +878,7 @@ static void prvRedrawWidgets(void)
     {
         last_state    = (MotorState_t)-1;
         last_rpm      = -1;
+        last_rpm_des  = -1;
         last_pwr_int  = -1;
         last_is_night = !last_is_night;
         last_lux_int  = -10000;
@@ -770,14 +889,16 @@ static void prvRedrawWidgets(void)
         last_temp_10  = -100000;
         last_hum_10   = -100000;
         last_pres_10  = -100000;
+        last_fault_bits = (EventBits_t)-1;
         g_force_refresh = false;
     }
-
-    char buf[24];
 
     if (g_ui32Panel == 0)
     {
         /* ---- Control tab: motor + day/night + clock. ---- */
+        static char s_rpm_buf[24];
+        static char s_power_buf[24];
+        static char s_clock_buf[24];
 
         if (g_state != last_state)
         {
@@ -796,22 +917,53 @@ static void prvRedrawWidgets(void)
             g_sStatusIndicator.ui32FillColor = col;
             WidgetPaint((tWidget *)&g_sStatusIndicator);
             last_state = g_state;
+            last_fault_bits = (EventBits_t)-1;
         }
 
-        if (g_rpm_actual != last_rpm)
+        if (g_fault_bits != last_fault_bits)
         {
-            usprintf(buf, "%d RPM", (int)g_rpm_actual);
-            CanvasTextSet(&g_sRpmText, buf);
+            prvRefreshControlStatusLine();
+            last_fault_bits = g_fault_bits;
+        }
+        else if (g_state == MOTOR_STATE_FAULT_LATCHED ||
+                 g_state == MOTOR_STATE_ESTOP_BRAKING)
+        {
+            /* Keep fault text visible while latched (not only on bit change). */
+            prvRefreshControlStatusLine();
+        }
+        else if (g_state == MOTOR_STATE_IDLE &&
+                 (g_fault_bits & EVT_ESTOP_DRIVER))
+        {
+            prvRefreshControlStatusLine();
+        }
+        else if (g_state == MOTOR_STATE_STARTING ||
+                 g_state == MOTOR_STATE_RUNNING)
+        {
+            static uint16_t last_pwm = 0xFFFFu;
+            if (g_pwm_duty != last_pwm)
+            {
+                prvRefreshControlStatusLine();
+                last_pwm = g_pwm_duty;
+            }
+        }
+
+        if (g_rpm_actual != last_rpm || g_rpm_desired != last_rpm_des)
+        {
+            /* Show measured speed and slider target so % control is visible. */
+            usprintf(s_rpm_buf, "%d / %d RPM",
+                     (int)g_rpm_actual, (int)g_rpm_desired);
+            CanvasTextSet(&g_sRpmText, s_rpm_buf);
             WidgetPaint((tWidget *)&g_sRpmText);
-            last_rpm = g_rpm_actual;
+            last_rpm     = g_rpm_actual;
+            last_rpm_des = g_rpm_desired;
         }
 
         int p = (int)(g_power_w + 0.5f);
         int diff = (p > last_pwr_int) ? (p - last_pwr_int) : (last_pwr_int - p);
         if (last_pwr_int < 0 || diff >= 2)
         {
-            usprintf(buf, "%d W", p);
-            CanvasTextSet(&g_sPowerText, buf);
+            usprintf(s_power_buf, "%d W", p);
+            CanvasTextSet(&g_sPowerText, s_power_buf);
             WidgetPaint((tWidget *)&g_sPowerText);
             last_pwr_int = p;
         }
@@ -844,8 +996,8 @@ static void prvRedrawWidgets(void)
             uint32_t h = (sec / 3600) % 24;
             uint32_t m = (sec / 60) % 60;
             uint32_t s =  sec % 60;
-            usprintf(buf, "%02d:%02d:%02d", h, m, s);
-            CanvasTextSet(&g_sClockText, buf);
+            usprintf(s_clock_buf, "%02d:%02d:%02d", h, m, s);
+            CanvasTextSet(&g_sClockText, s_clock_buf);
             WidgetPaint((tWidget *)&g_sClockText);
             last_sec = sec;
         }
@@ -989,8 +1141,12 @@ static void prvGuiTask(void *pvParameters)
         while (xQueueReceive(xMotorQueue, &motor_msg, 0) == pdPASS)
         {
             g_state      = motor_msg.state;
-            g_rpm_actual = motor_msg.rpm_actual;
+            g_rpm_actual  = motor_msg.rpm_actual;
+            g_rpm_desired = motor_msg.rpm_desired;
             g_pwm_duty   = motor_msg.pwm_duty;
+            g_fault_bits = motor_msg.fault_bits;
+            g_hall_state = motor_msg.hall_state;
+            g_motor_ready = motor_msg.motor_ready;
             /* Motor task supplies simulated power until the DRV8323
              * is wired up and the sensor-task ADC pipeline goes live;
              * switch this back to sensor_msg.power_watts then. */

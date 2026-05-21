@@ -10,33 +10,31 @@ in `src/shared.h`.
 
 | Subsystem | Status |
 |---|---|
-| GUI (spec 2.3) | **Complete** — 4 tabs, threshold editor, day/night LED, plots |
+| GUI (spec 2.3) | **Complete** — 4 tabs, threshold editor, day/night LED, plots, DRV fault display |
 | Sensing — Light (OPT3001) | **Done** — 5 Hz polled, 8-tap MAF |
 | Sensing — Accel (BMI160) | **Done** — 200 Hz ISR pipeline, 8-tap MAF, E-Stop wired |
 | Sensing — T/RH/P (BME280) | **Done** — 1 Hz polled (substituted for spec-listed SHT31) |
-| Sensing — Power (DRV8323 ADC) | **Code complete, init commented out** — waits on motor BoosterPack |
-| Sensing — Speed (hall) | **Code complete, init commented out** — waits on hall wiring |
-| Motor control | **Simulation only** — state machine + ramped RPM; real MotorLib commutation TODO |
-| Fault task | Skeleton — logs faults, no actions yet |
+| Sensing — Power (DRV8323 ADC) | **Code complete** — `power_sensor_init()` still commented out in `sensor_task.c` |
+| Sensing — Speed (hall) | **Done** — `prvSpeedTask` @ 100 Hz, sector-valid edge counting, exp LPF |
+| Motor control | **Done** — MotorLib commutation, open-loop duty from slider, state machine, nFAULT (PL0) |
+| RTOS / concurrency | **Documented + hardened** — see [RTOS and concurrency](#rtos-and-concurrency) |
+| Fault task | **Skeleton** — waits on `EVT_ESTOP_*`, UART logging TODO |
 
 ---
 
 ## What's still to do
 
-1. **Plug in the motor BoosterPack**, then in `src/tasks/sensor_task.c` uncomment
-   `power_sensor_init()`, and in `src/tasks/motor_task.c` uncomment the
-   `prvSpeedTask` xTaskCreate.
-2. **Real motor commutation** — replace the simulation in `prvMotorTask()`
-   steps 3–6 with MotorLib (`setDuty`, `updateMotor`, hall reads).
-3. **GUI** → consume sensor-task power instead of motor-task simulated power
-   (`gui_task.c`: change `g_power_w = motor_msg.power_watts` back to
-   `sensor_msg.power_watts`).
-4. **Tighten thresholds** for the final demo. Day/night already at `<5 lux`
+1. **Uncomment `power_sensor_init()`** in `src/tasks/sensor_task.c` when the motor
+   BoosterPack ADC path is wired; point GUI power readout at `sensor_msg.power_watts`
+   if that becomes the canonical source.
+2. **Tighten thresholds** for the final demo. Day/night already at `<5 lux`
    per spec when `DAYNIGHT_DESK_TEST` is undefined.
-5. **Pinout verify on hardware** — `SOA/SOB` ADC channels, hall ports,
-   `SPEED_EDGES_PER_REV` (pole pairs of the motor).
-6. **Report**: justify BME280-instead-of-SHT31 substitution and filter
+3. **Pinout verify on hardware** — `SOA/SOB` ADC channels, hall ports (PM3/PH2/PN2),
+   `SPEED_EDGES_PER_REV` (pole pairs), nFAULT on PL0 (red LED on motor board).
+4. **Report**: justify BME280-instead-of-SHT31 substitution and filter
    choices (MAF for accel/light/power, exponential LPF for RPM).
+5. **RTOS polish (optional)** — migrate remaining `UARTprintf` in BMI160/BME280/OPT3001
+   init and add logging in `fault_task.c`; see concurrency notes below.
 
 ---
 
@@ -50,6 +48,80 @@ pio device monitor     # opens at 115200 (pinned in platformio.ini)
 
 Serial output is a CSV plot stream — pipe into Tera Term Plotter, Serial
 Plotter, or `pandas.read_csv()` for the report figures.
+
+Tasks that log after the scheduler starts should use `uart_log_printf()`
+(`src/utils/uart_log.c`) so lines are not interleaved on the shared UART.
+
+---
+
+## RTOS and concurrency
+
+FreeRTOS runs **five preemptive tasks** (no coroutines). Priorities are
+documented in `include/shared.h` / `src/shared.h` (higher number = higher
+priority on this port):
+
+| Task | Priority | Rate / role |
+|------|----------|-------------|
+| Speed | `idle+5` | 100 Hz hall RPM (`speed_sensor_tick`) |
+| AccSamp | `idle+5` | 200 Hz BMI160 I2C (Timer2A → semaphore) |
+| Motor | `idle+4` | 100 Hz state machine, PWM, nFAULT poll |
+| Sensor | `idle+3` | 50 Hz fusion, E-stop checks, UART CSV |
+| GUI | `idle+2` | Touch + grlib display (~50 Hz effective) |
+| Fault | `idle+1` | Blocks on fault bits (logging stub) |
+
+Speed and AccSamp share priority 5 and **time-slice** when both are ready.
+
+### Inter-thread communication
+
+```
+GUI  --xCommandQueue + xCommandMutex--> Motor
+GUI  --xSystemEvents (START/STOP/ACK)--> Motor, Sensor
+Motor--xMotorQueue--------------------> GUI
+Sensor-xSensorQueue-------------------> GUI
+ADC ISR --xPowerRawQueue-------------> Sensor
+Timer2A --xAccelRawQueue + sem-------> AccSamp
+Sensor --xSystemEvents (E-stop bits)--> Motor
+```
+
+### Synchronisation primitives (`main.c`)
+
+| Object | Purpose |
+|--------|---------|
+| `xUARTMutex` | Serialises UART output via `uart_log_printf()` |
+| `xI2CMutex` | One transaction at a time on shared I2C0 |
+| `xCommandMutex` | GUI `xQueueReset`/`xQueueSend` vs motor `xQueueReceive` |
+| `xSystemEvents` | START/STOP/ACK, E-stops, night mode, threshold advisory bit |
+
+### Concurrent access (design choices)
+
+| Resource | Protection |
+|----------|------------|
+| **I2C bus** | `xI2CMutex` in sensor task and AccSamp task |
+| **UART** | `xUARTMutex` in `uart_log_printf()` (motor + sensor tasks migrated) |
+| **Command queue** | `xCommandMutex` around send/receive/drain on both GUI and motor |
+| **MotorLib** | Not re-entrant: task calls use `IntMasterDisable()` in `motor_driver.c`; hall ISRs call `updateMotor()` at NVIC priority `configMAX_SYSCALL_INTERRUPT_PRIORITY + 1` |
+| **Hall edge counter `g_edges`** | ISR writers; `speed_sensor_tick()` snapshots with `IntMasterDisable()` |
+| **Thresholds `g_thresh_*`** | `volatile`; single-word writes on Cortex-M4 — no mutex |
+| **`g_motor_estop_armed`** | `volatile bool`; sensor only asserts accel/power E-stop while motor may run |
+| **grlib / LCD** | Only touched from GUI task — no display mutex |
+
+### ISR ↔ FreeRTOS rules
+
+- **ADC (power):** `xQueueSendFromISR` on `xPowerRawQueue` (drops sample if full).
+- **Timer2A (accel):** priority set to `configMAX_SYSCALL_INTERRUPT_PRIORITY`;
+  `xSemaphoreGiveFromISR` on `s_xAccelTickSem`.
+- **Hall GPIO:** no FromISR APIs; commutation only. Priority above syscall threshold
+  so hall ISRs do not call FreeRTOS FromISR helpers incorrectly.
+
+### Scheduling and contention notes
+
+- Motor → GUI: `xMotorQueue` depth **16**; `xQueueSend` uses a **1 ms** timeout so a
+  slow GUI cannot block the motor loop indefinitely.
+- Motor task clears `EVT_ESTOP_*` / user bits on read (`pdTRUE` auto-clear); sensor
+  task sets/clears power/accel E-stop bits; fault task waits **without** clearing.
+- **Residual risks:** BMI160/BME280/OPT3001 init still use raw `UARTprintf`;
+  `fault_task` does not log yet; ISR-side `updateMotor()` is not masked when the
+  motor task has interrupts enabled between MotorLib calls (task side masks globally).
 
 ---
 
@@ -71,14 +143,15 @@ and **what flows out** (with the consumer). RTOS object names match
 | `prvSensorTask` (power threshold) | `xSystemEvents` bit `EVT_ESTOP_POWER` | any → E-Stop Braking |
 | `prvSensorTask` (accel threshold) | `xSystemEvents` bit `EVT_ESTOP_ACCEL` | any → E-Stop Braking |
 | `prvSensorTask` (distance threshold) | `xSystemEvents` bit `EVT_ESTOP_DISTANCE` | any → E-Stop Braking |
+| DRV8323 nFAULT (PL0, polled) | `motor_driver_hardware_fault_active()` | any → E-Stop Braking / Fault Latched (`EVT_ESTOP_DRIVER`) |
 
 **Publishes out:**
 | Object | Field | Consumer |
 |---|---|---|
 | `xMotorQueue` (MotorMsgObj) | `state` (MotorState_t) | `prvGuiTask` — state-text canvas + status indicator colour |
-| `xMotorQueue` | `rpm_actual` | `prvGuiTask` — RPM readout + RPM plot trace |
-| `xMotorQueue` | `pwm_duty` | (currently unused; reserved for real motor) |
-| `xMotorQueue` | `power_watts` | `prvGuiTask` — power readout (simulated; will move to sensor msg) |
+| `xMotorQueue` | `rpm_actual`, `rpm_desired`, `rpm_reference` | `prvGuiTask` — RPM readout + plot |
+| `xMotorQueue` | `pwm_duty`, `hall_state`, `fault_bits`, `motor_ready` | `prvGuiTask` — duty %, status line, fault text |
+| `xMotorQueue` | `power_watts` | `prvGuiTask` — power readout (until sensor ADC path is primary) |
 
 ---
 
@@ -122,15 +195,13 @@ and **what flows out** (with the consumer). RTOS object names match
 
 ---
 
-### `prvSpeedTask` (priority 5, **currently disabled**) — `tasks/motor_task.c`
+### `prvSpeedTask` (priority 5) — `tasks/motor_task.c`
 
-Will run once hall sensors are physically wired (see "What's still to do").
+**Reads in:** hall edge counter `g_edges` (valid sector changes only; ISRs in
+`drivers/speed_sensor.c` on PM3/PH2/PN2).
 
-**Reads in:** hall edge counter `g_edges` (incremented by `HallPortMIntHandler` /
-`HallPortHIntHandler` / `HallPortNIntHandler` in `drivers/speed_sensor.c`).
-
-**Publishes out:** filtered RPM accessible via `speed_sensor_get_rpm()` —
-consumed by `prvMotorTask` (closed-loop control) and the CSV stream.
+**Publishes out:** filtered RPM via `speed_sensor_get_rpm()` — display and CSV;
+motor control uses open-loop duty from slider (`motor_driver_set_speed_rpm`).
 
 ---
 
@@ -145,7 +216,7 @@ consumed by `prvMotorTask` (closed-loop control) and the CSV stream.
 **Publishes out:**
 | Object | Trigger | Consumer |
 |---|---|---|
-| `xCommandQueue` (int32_t RPM) | Slider drag | `prvMotorTask` (desired RPM) |
+| `xCommandQueue` (int32_t RPM) | Slider drag / START min RPM | `prvMotorTask` (under `xCommandMutex`) |
 | `xSystemEvents` bit `EVT_USER_START` | START button | `prvMotorTask` |
 | `xSystemEvents` bit `EVT_USER_STOP` | STOP button | `prvMotorTask` |
 | `xSystemEvents` bit `EVT_USER_ESTOP_ACK` | ACK button | `prvMotorTask` |
@@ -154,34 +225,42 @@ consumed by `prvMotorTask` (closed-loop control) and the CSV stream.
 
 ---
 
-### `prvFaultTask` (priority TBD) — `tasks/fault_task.c`
+### `prvFaultTask` (priority 1) — `tasks/fault_task.c`
 
-Currently a skeleton — intended to watch `xSystemEvents` for `EVT_ESTOP_*`
-bits and journal a fault record. No outputs yet.
+Waits on `EVT_ESTOP_ANY | EVT_SENSOR_FAULT` without clearing (motor task
+consumes E-stop bits in its state machine). UART fault journal not implemented yet.
 
 ---
 
 ## Shared RTOS objects (defined once in `main.c`)
 
 ```
-xMotorQueue       motor    -> gui      (8 × MotorMsgObj)
+xMotorQueue       motor    -> gui      (16 × MotorMsgObj)
 xSensorQueue      sensor   -> gui      (8 × SensorMsgObj)
-xCommandQueue     gui      -> motor    (4 × int32_t  RPM)
+xCommandQueue     gui      -> motor    (4 × int32_t RPM)
 xPowerRawQueue    ADC ISR  -> sensor   (64 × PowerSampleRaw_t)
 xAccelRawQueue    Timer ISR-> sampler  (32 × AccelSampleRaw_t)
 xSystemEvents     all      <-> all     (event group, bits below)
-xUARTMutex        all                   (serialises UARTprintf calls)
-xI2CMutex         sensor + sampler      (serialises every I2C0 transaction)
+xUARTMutex        uart_log              (thread-safe logging after scheduler)
+xI2CMutex         sensor + AccSamp      (every I2C0 transaction)
+xCommandMutex     gui + motor           (xCommandQueue send/receive/reset)
 ```
 
 Event-group bits live in `shared.h`:
 
 ```
-EVT_ESTOP_POWER / EVT_ESTOP_ACCEL / EVT_ESTOP_DISTANCE
-EVT_ESTOP_ANY = (POWER | ACCEL | DISTANCE)
+EVT_ESTOP_POWER / EVT_ESTOP_ACCEL / EVT_ESTOP_DISTANCE / EVT_ESTOP_DRIVER
+EVT_ESTOP_ANY = (POWER | ACCEL | DISTANCE | DRIVER)
 EVT_NIGHT_DETECTED  EVT_SENSOR_FAULT
 EVT_USER_START      EVT_USER_STOP        EVT_USER_ESTOP_ACK
 EVT_USER_SPEED_CHANGED                   EVT_USER_THRESHOLD_CHANGED
+```
+
+Runtime flags in `main.c` (no mutex — single-word / bool writes):
+
+```
+g_thresh_power_w   g_thresh_accel_g   g_thresh_distance_mm   (GUI writes, sensor reads)
+g_motor_estop_armed                         (motor sets; sensor gates E-stop asserts)
 ```
 
 ---
@@ -191,7 +270,7 @@ EVT_USER_SPEED_CHANGED                   EVT_USER_THRESHOLD_CHANGED
 ```
 Power:   Timer0A ----trigger----> ADC1 SS0  -> ISR ----> xPowerRawQueue ----> sensor task MAF ----> SensorMsgObj.power_watts + EVT_ESTOP_POWER
 Accel:   Timer2A IRQ ----sem----> AccSamp task -> BMI160 I2C read -> xAccelRawQueue ----> sensor task MAF ----> SensorMsgObj.accel_* + EVT_ESTOP_ACCEL
-Hall:    GPIO edge ----IRQ-----> g_edges++  -> 100 Hz speed_sensor_tick (in prvSpeedTask) -> exp LPF -> speed_sensor_get_rpm()
+Hall:    GPIO edge ----IRQ-----> valid sector -> g_edges++ -> 100 Hz prvSpeedTask tick -> exp LPF -> speed_sensor_get_rpm() + MotorLib commutation in ISR
 Light:   sensor task polls OPT3001 @ 5 Hz -> MAF -> SensorMsgObj.light_lux + EVT_NIGHT_DETECTED
 T/H/P:   sensor task polls BME280  @ 1 Hz -> SensorMsgObj.temp_c / humidity_pct / pressure_hpa
 ```

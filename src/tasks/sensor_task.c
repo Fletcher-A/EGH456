@@ -54,6 +54,7 @@
 #include "drivers/bme280.h"
 #include "drivers/power_sensor.h"
 #include "utils/uartstdio.h"
+#include "utils/uart_log.h"
 
 #include "shared.h"
 /*-----------------------------------------------------------*/
@@ -179,7 +180,7 @@ void Timer2AIntHandler(void)
 static void prvAccelSamplerTask(void *pvParameters)
 {
     (void)pvParameters;
-    UARTprintf("AccSamp task started, sem=%p\n", s_xAccelTickSem);
+    uart_log_printf("AccSamp task started, sem=%p\n", s_xAccelTickSem);
     for (;;)
     {
         if (xSemaphoreTake(s_xAccelTickSem, portMAX_DELAY) != pdTRUE) continue;
@@ -227,33 +228,33 @@ static void prvSensorTask(void *pvParameters)
     // UARTprintf("Power sensor init (Timer0A -> ADC1 SS0 @ %d Hz)\n",
     //            POWER_SENSOR_SAMPLE_HZ);
 
-    UARTprintf("BMI160 init...\n");
+    uart_log_printf("BMI160 init...\n");
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool bmi_ok = bmi160_init();
     xSemaphoreGive(xI2CMutex);
-    UARTprintf("BMI160 %s\n", bmi_ok ? "ready" : "init FAILED");
+    uart_log_printf("BMI160 %s\n", bmi_ok ? "ready" : "init FAILED");
 
     /* Spin up the 200 Hz accel sampling pipeline only if the IMU
      * came up. Otherwise we'd queue zeroes forever. */
     if (bmi_ok)
     {
         s_xAccelTickSem = xSemaphoreCreateBinary();
-        UARTprintf("AccSem create -> %p\n", s_xAccelTickSem);
+        uart_log_printf("AccSem create -> %p\n", s_xAccelTickSem);
         TaskHandle_t hAccSamp = NULL;
         BaseType_t r = xTaskCreate(prvAccelSamplerTask, "AccSamp",
                     configMINIMAL_STACK_SIZE * 2, NULL,
                     tskIDLE_PRIORITY + 5, &hAccSamp);
-        UARTprintf("AccSamp task create -> %d  handle=%p\n",
-                   (int)r, hAccSamp);
+        uart_log_printf("AccSamp task create -> %d  handle=%p\n",
+                        (int)r, hAccSamp);
         prvAccelTimerInit();
-        UARTprintf("Accel sampler (Timer2A @ %d Hz)\n", ACCEL_SAMPLE_HZ);
+        uart_log_printf("Accel sampler (Timer2A @ %d Hz)\n", ACCEL_SAMPLE_HZ);
     }
 
-    UARTprintf("BME280 init...\n");
+    uart_log_printf("BME280 init...\n");
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool bme_ok = bme280_init();
     xSemaphoreGive(xI2CMutex);
-    UARTprintf("BME280 %s\n", bme_ok ? "ready" : "init FAILED");
+    uart_log_printf("BME280 %s\n", bme_ok ? "ready" : "init FAILED");
 
     float    light_lux  = 0.0f;
     float    accel_mag  = 0.0f;
@@ -280,9 +281,9 @@ static void prvSensorTask(void *pvParameters)
      *   p_dhpa                pressure * 10            (hPa)
      *   rpm_raw, rpm_filt     RPM (integer)
      */
-    UARTprintf("t,p_raw_mw,p_filt_mw,lux_raw,lux_filt,"
-               "ax_mg,ay_mg,az_mg,acc_raw_mg,acc_filt_mg,"
-               "t_cc,h_cp,p_dhpa,rpm_raw,rpm_filt\n");
+    uart_log_printf("t,p_raw_mw,p_filt_mw,lux_raw,lux_filt,"
+                    "ax_mg,ay_mg,az_mg,acc_raw_mg,acc_filt_mg,"
+                    "t_cc,h_cp,p_dhpa,rpm_raw,rpm_filt\n");
 
     TickType_t xLastWake = xTaskGetTickCount();
 
@@ -300,8 +301,14 @@ static void prvSensorTask(void *pvParameters)
             float i_filt = prvPowMAFUpdate(i_total_raw);
             power_w = POWER_SENSOR_VOLTAGE_V * i_filt;
         }
-        if (power_w > g_thresh_power_w)
+        if (g_motor_estop_armed && power_w > g_thresh_power_w)
+        {
             xEventGroupSetBits(xSystemEvents, EVT_ESTOP_POWER);
+        }
+        else
+        {
+            xEventGroupClearBits(xSystemEvents, EVT_ESTOP_POWER);
+        }
 
         /* ---- Lux: poll OPT3001 at 5 Hz (every 10th tick). */
         if ((tick_count % LUX_READ_EVERY_N) == 0)
@@ -334,8 +341,14 @@ static void prvSensorTask(void *pvParameters)
             raw_total_g = prvAbsF(ax_g) + prvAbsF(ay_g) + prvAbsF(az_g);
             accel_mag = prvAccMAFUpdate(raw_total_g);
 
-            if (accel_mag > g_thresh_accel_g)
-                xEventGroupSetBits(xSystemEvents, EVT_ESTOP_ACCEL);
+        }
+        if (g_motor_estop_armed && accel_mag > g_thresh_accel_g)
+        {
+            xEventGroupSetBits(xSystemEvents, EVT_ESTOP_ACCEL);
+        }
+        else
+        {
+            xEventGroupClearBits(xSystemEvents, EVT_ESTOP_ACCEL);
         }
 
         /* ---- BME280: 1 Hz read (its own internal oversampling). */
@@ -369,40 +382,31 @@ static void prvSensorTask(void *pvParameters)
         /* Diagnostic dump every 50 ticks (1 s). */
         if ((tick_count % 50) == 0)
         {
-            UARTprintf("DBG  T2A=%u  AccRun=%u  RdOK=%u  RdFail=%u  Drained=%u\n",
-                       (unsigned)g_dbg_timer2a_irqs,
-                       (unsigned)g_dbg_accsamp_runs,
-                       (unsigned)g_dbg_accsamp_reads_ok,
-                       (unsigned)g_dbg_accsamp_reads_fail,
-                       (unsigned)g_dbg_queue_drained);
+            uart_log_printf("DBG  T2A=%u  AccRun=%u  RdOK=%u  RdFail=%u  Drained=%u\n",
+                            (unsigned)g_dbg_timer2a_irqs,
+                            (unsigned)g_dbg_accsamp_runs,
+                            (unsigned)g_dbg_accsamp_reads_ok,
+                            (unsigned)g_dbg_accsamp_reads_fail,
+                            (unsigned)g_dbg_queue_drained);
         }
 
-        /* ---- Serial plot: one CSV line per tick (50 Hz). Each value
-         * is integer-scaled to avoid pulling in libc's %f. Units are
-         * documented in the CSV header above. */
-        if (xSemaphoreTake(xUARTMutex, 0) == pdTRUE)
-        {
-            /* Print in two halves to keep the per-call printf
-             * argument count modest. */
-            UARTprintf("%u,%d,%d,%d,%d,%d,%d,%d,",
-                       (unsigned)tick_count,
-                       (int)(i_total_raw * POWER_SENSOR_VOLTAGE_V * 1000),
-                       (int)(power_w * 1000),
-                       (int)raw_lux,
-                       (int)light_lux,
-                       (int)(ax_g * 1000),
-                       (int)(ay_g * 1000),
-                       (int)(az_g * 1000));
-            UARTprintf("%d,%d,%d,%d,%d,%d,%d\n",
-                       (int)(raw_total_g * 1000),
-                       (int)(accel_mag   * 1000),
-                       (int)(temp_c   * 100),
-                       (int)(hum_pct  * 100),
-                       (int)(pres_hpa * 10),
-                       (int)speed_sensor_get_rpm_raw(),
-                       (int)speed_sensor_get_rpm());
-            xSemaphoreGive(xUARTMutex);
-        }
+        /* ---- Serial plot: one CSV line per tick (50 Hz). */
+        uart_log_printf("%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                        (unsigned)tick_count,
+                        (int)(i_total_raw * POWER_SENSOR_VOLTAGE_V * 1000),
+                        (int)(power_w * 1000),
+                        (int)raw_lux,
+                        (int)light_lux,
+                        (int)(ax_g * 1000),
+                        (int)(ay_g * 1000),
+                        (int)(az_g * 1000),
+                        (int)(raw_total_g * 1000),
+                        (int)(accel_mag * 1000),
+                        (int)(temp_c * 100),
+                        (int)(hum_pct * 100),
+                        (int)(pres_hpa * 10),
+                        (int)speed_sensor_get_rpm_raw(),
+                        (int)speed_sensor_get_rpm());
     }
 }
 

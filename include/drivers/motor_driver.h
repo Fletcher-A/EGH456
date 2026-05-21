@@ -2,24 +2,28 @@
  * motor_driver.h — Modular motor API (assignment 2.1.7).
  *
  * Wraps MotorLib (initMotorLib/setDuty/updateMotor/stopMotor) and the
- * hall-sensor speed logic into a clean interface that motor_task uses.
+ * hall-sensor GPIO used for speed and commutation updates.
  */
 #ifndef MOTOR_DRIVER_H
 #define MOTOR_DRIVER_H
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "shared.h"     /* for MotorState_t */
+#include "shared.h"
 
-void          motor_driver_init(void);          /* sets up MotorLib + halls */
-void          motor_driver_start(void);         /* IDLE -> STARTING kickstart */
+void          motor_driver_init(void);
+void          motor_driver_start(void);
 void          motor_driver_stop(bool brakeHard);
-void          motor_driver_estop(void);         /* immediate fault */
-void          motor_driver_set_duty(uint16_t duty);
-int32_t       motor_driver_get_rpm(void);       /* latest filtered speed */
+void          motor_driver_estop(void);
+void          motor_driver_update_commutation(void);
+/* Map commanded RPM (0..4000) to MotorLib PWM microseconds and apply. */
+void          motor_driver_set_speed_rpm(int32_t rpm);
+/* Returns PWM duty 0..100 % (for GUI / debug). */
+uint16_t      motor_driver_get_duty_percent(void);
+int32_t       motor_driver_get_rpm(void);
 MotorState_t  motor_driver_get_state(void);
-
-/* Hall ISR — invoked from the GPIO Port handler in startup_gcc.c. */
-void HallSensorHandler(void);
+bool          motor_driver_is_ready(void);
+/* True when DRV8323 nFAULT is asserted (active low; red LED on motor board). */
+bool          motor_driver_hardware_fault_active(void);
 
 #endif /* MOTOR_DRIVER_H */
