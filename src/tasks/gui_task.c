@@ -97,6 +97,7 @@ static tDMAControlTable s_DMAControlTable[64] __attribute__ ((aligned(1024)));
 
 static MotorState_t g_state           = MOTOR_STATE_IDLE;
 static int32_t      g_rpm_actual      = 0;
+static int32_t      g_rpm_reference   = 0;
 static int32_t      g_rpm_desired     = 0;
 static uint16_t     g_pwm_duty        = 0;
 static float        g_power_w         = 0.0f;
@@ -151,6 +152,10 @@ extern tPushButtonWidget g_sThreshDistInc;
 /*-----------------------------------------------------------*/
 /* Control-panel widgets. */
 
+/* Inset from 320 px wide LCD so the slider track clears the bezel. */
+#define CTRL_SLIDER_W   180
+#define CTRL_SLIDER_X   ((320 - CTRL_SLIDER_W) / 2)   /* centred, ~70 px bezel each side */
+
 Canvas(g_sStateText, g_psPanels, 0, 0, &g_sKentec320x240x16_SSD2119,
        10, 30, 180, 24,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL,
@@ -164,9 +169,9 @@ Canvas(g_sStatusIndicator, g_psPanels, &g_sStateText, 0,
 
 Canvas(g_sRpmText, g_psPanels, &g_sStatusIndicator, 0,
        &g_sKentec320x240x16_SSD2119,
-       10, 60, 200, 20,
+       10, 60, 300, 20,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL,
-       ClrBlack, 0, ClrSilver, &g_sFontCm18, "0 RPM", 0, 0);
+       ClrBlack, 0, ClrSilver, &g_sFontCm14, "0 / 0 / 0 RPM", 0, 0);
 
 Canvas(g_sPowerText, g_psPanels, &g_sRpmText, 0,
        &g_sKentec320x240x16_SSD2119,
@@ -203,11 +208,11 @@ Canvas(g_sClockText, g_psPanels, &g_sPowerLimitText, 0,
 tSliderWidget g_sSpeedSlider =
     SliderStruct(g_psPanels, &g_sClockText, 0,
                  &g_sKentec320x240x16_SSD2119,
-                 10, 150, 300, 24, 0, 100, 0,
+                 CTRL_SLIDER_X, 150, CTRL_SLIDER_W, 24, 0, MAX_MOTOR_RPM, 0,
                  (SL_STYLE_FILL | SL_STYLE_BACKG_FILL | SL_STYLE_OUTLINE |
                   SL_STYLE_TEXT | SL_STYLE_BACKG_TEXT),
                  ClrBlue, ClrBlack, ClrSilver, ClrWhite, ClrWhite,
-                 &g_sFontCm16, "Speed 0%", 0, 0, OnSpeedSliderChange);
+                 &g_sFontCm16, "0 RPM", 0, 0, OnSpeedSliderChange);
 
 RectangularButton(g_sStartBtn, g_psPanels, &g_sSpeedSlider, 0,
                   &g_sKentec320x240x16_SSD2119,
@@ -270,12 +275,14 @@ Canvas(g_sPlotCanvas, g_psPanels + 1, 0, 0, &g_sKentec320x240x16_SSD2119,
        CANVAS_STYLE_OUTLINE | CANVAS_STYLE_APP_DRAWN,
        0, ClrGray, 0, 0, 0, 0, OnPlotCanvasPaint);
 
-#define PLOT_X        12
-#define PLOT_Y        32
-#define PLOT_W        296
-#define PLOT_H        196
+/* Screen coords; leave left/bottom margin for axis titles (canvas y=30, h=200). */
+#define PLOT_X        26
+#define PLOT_Y        34
+#define PLOT_W        282
+#define PLOT_H        178
+#define PLOT_WINDOW_S 8.0f        /* 40 samples x 200 ms sample period */
 #define PLOT_SAMPLES  40
-#define PLOT_RPM_MAX    4000.0f
+#define PLOT_RPM_MAX    ((float)MAX_MOTOR_RPM)
 #define PLOT_POWER_MAX   200.0f
 #define PLOT_LUX_MAX     500.0f
 #define PLOT_ACCEL_MAX     2.0f       /* +-2 g full scale, centred on plot */
@@ -361,9 +368,34 @@ static void prvDrawTrace(tContext *ctx, const float *flat, uint32_t count,
     }
 }
 
+static void prvDrawPlotAxesAndTitles(tContext *psContext)
+{
+    const int yAxisX = PLOT_Y + PLOT_H;
+
+    GrContextForegroundSet(psContext, ClrSilver);
+    GrLineDrawV(psContext, PLOT_X, PLOT_Y, yAxisX);
+    GrLineDrawH(psContext, PLOT_X, PLOT_X + PLOT_W, yAxisX);
+
+    /* Y-axis title (left margin). */
+    GrContextFontSet(psContext, &g_sFontCm12);
+    GrStringDraw(psContext, "Norm.", -1, 2, PLOT_Y + (PLOT_H / 2) - 14, 1);
+    GrStringDraw(psContext, "value", -1, 2, PLOT_Y + (PLOT_H / 2) - 2, 1);
+
+    /* X-axis title and tick labels (40 samples @ 5 Hz -> 8 s window). */
+    const int yXLabel = yAxisX + 8;
+    GrContextFontSet(psContext, &g_sFontCm14);
+    GrStringDrawCentered(psContext, "Time (s)", -1,
+                         PLOT_X + (PLOT_W / 2), yXLabel, 1);
+    GrContextFontSet(psContext, &g_sFontCm12);
+    GrStringDraw(psContext, "0", -1, PLOT_X, yXLabel, 1);
+    GrStringDraw(psContext, "8", -1, PLOT_X + PLOT_W - 10, yXLabel, 1);
+}
+
 static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
 {
     (void)psWidget;
+
+    prvDrawPlotAxesAndTitles(psContext);
 
     /* Erase previous frame in black. */
     if (g_prev_count >= 2)
@@ -413,14 +445,12 @@ static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
     }
     g_prev_count = g_plot_count;
 
-    /* Axis labels — maxima across the top, minima across the bottom,
-     * each colour-matched to its trace.  Compacted (no spaces inside
-     * units) so the seven labels fit across the 296-px plot width. */
+    /* Per-trace scale hints (colour-matched); axes titled separately. */
     GrContextFontSet(psContext, &g_sFontCm12);
     GrContextBackgroundSet(psContext, ClrBlack);
 
-    const int yTop = PLOT_Y + 2;
-    const int yBot = PLOT_Y + PLOT_H - 14;
+    const int yTop = PLOT_Y + 10;
+    const int yBot = PLOT_Y + PLOT_H - 18;
 
     /* Column X offsets within the plot. Tuned to leave a couple of
      * pixels gap between adjacent labels at 12-pt CM. */
@@ -433,8 +463,8 @@ static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
     const int xPres  = PLOT_X + 232;
 
     GrContextForegroundSet(psContext, ClrGoldenrod);
-    GrStringDraw(psContext, "4000RPM",  -1, xRPM,  yTop, 1);
-    GrStringDraw(psContext, "0RPM",     -1, xRPM,  yBot, 1);
+    GrStringDraw(psContext, "10000",    -1, xRPM,  yTop, 1);
+    GrStringDraw(psContext, "0",        -1, xRPM,  yBot, 1);
 
     GrContextForegroundSet(psContext, ClrCyan);
     GrStringDraw(psContext, "200W",     -1, xPow,  yTop, 1);
@@ -673,6 +703,54 @@ static void prvSwapPanel(uint32_t idx)
 /*-----------------------------------------------------------*/
 /* Button callbacks — send signals to the motor task. */
 
+static int32_t prvClampSliderRpm(int32_t rpm)
+{
+    if (rpm < 0)
+    {
+        return 0;
+    }
+    if (rpm > MAX_MOTOR_RPM)
+    {
+        return MAX_MOTOR_RPM;
+    }
+    return rpm;
+}
+
+/* GrLib maps touch X to RPM with integer division, so the rightmost pixel
+ * is usually below i32Max (worse on a short track — e.g. ~9945 at 180 px). */
+static int32_t prvSliderTrackPixels(void)
+{
+    int16_t span = (g_sSpeedSlider.sBase.sPosition.i16XMax -
+                    g_sSpeedSlider.sBase.sPosition.i16XMin) + 1;
+    if (g_sSpeedSlider.ui32Style & SL_STYLE_OUTLINE)
+    {
+        span -= 2;
+    }
+    return (span > 0) ? (int32_t)span : 1;
+}
+
+static int32_t prvNormalizeSliderRpm(int32_t rpm)
+{
+    int32_t track = prvSliderTrackPixels();
+    int32_t max_gap = (MAX_MOTOR_RPM + track - 1) / track;
+
+    rpm = prvClampSliderRpm(rpm);
+    if (rpm > MAX_MOTOR_RPM - max_gap)
+    {
+        return MAX_MOTOR_RPM;
+    }
+    return rpm;
+}
+
+static void prvRefreshSpeedSliderLabel(int32_t rpm)
+{
+    static char buf[24];
+
+    rpm = prvClampSliderRpm(rpm);
+    usprintf(buf, "%d RPM", (int)rpm);
+    SliderTextSet(&g_sSpeedSlider, buf);
+}
+
 static void prvSendLatestRpmCommand(int32_t rpm)
 {
     /* Slider callbacks can generate several commands before the motor task
@@ -693,17 +771,12 @@ static void prvSendLatestRpmCommand(int32_t rpm)
 static void OnStartPressed(tWidget *psWidget)
 {
     (void)psWidget;
-    int32_t pct = g_sSpeedSlider.i32Value;
-    int32_t rpm = (pct * 4000) / 100;
-    /* Slider defaults to 0%; motor task only leaves Idle when desired RPM > 0. */
+    int32_t rpm = prvNormalizeSliderRpm(g_sSpeedSlider.i32Value);
     if (rpm < MIN_START_RPM)
     {
         rpm = MIN_START_RPM;
-        pct = (rpm * 100) / 4000;
-        SliderValueSet(&g_sSpeedSlider, pct);
-        static char buf[20];
-        usprintf(buf, "Speed %d%%", (int)pct);
-        SliderTextSet(&g_sSpeedSlider, buf);
+        SliderValueSet(&g_sSpeedSlider, rpm);
+        prvRefreshSpeedSliderLabel(rpm);
         WidgetPaint((tWidget *)&g_sSpeedSlider);
     }
     prvSendLatestRpmCommand(rpm);
@@ -722,8 +795,10 @@ static void OnStartPressed(tWidget *psWidget)
 static void OnStopPressed(tWidget *psWidget)
 {
     (void)psWidget;
-    int32_t rpm = 0;
-    prvSendLatestRpmCommand(rpm);
+    prvSendLatestRpmCommand(0);
+    SliderValueSet(&g_sSpeedSlider, 0);
+    prvRefreshSpeedSliderLabel(0);
+    WidgetPaint((tWidget *)&g_sSpeedSlider);
     xEventGroupSetBits(xSystemEvents, EVT_USER_STOP);
 }
 
@@ -736,14 +811,14 @@ static void OnEStopAckPressed(tWidget *psWidget)
 static void OnSpeedSliderChange(tWidget *psWidget, int32_t i32Value)
 {
     (void)psWidget;
-    /* Slider 0..100 % -> 0..4000 RPM. The motor task picks up the
-     * new desired RPM via the command queue and ramps to it. */
-    int32_t rpm = (i32Value * 4000) / 100;
-    prvSendLatestRpmCommand(rpm);
+    int32_t rpm = prvNormalizeSliderRpm(i32Value);
+    if (rpm == MAX_MOTOR_RPM && i32Value != MAX_MOTOR_RPM)
+    {
+        SliderValueSet(&g_sSpeedSlider, MAX_MOTOR_RPM);
+    }
 
-    static char buf[20];
-    usprintf(buf, "Speed %d%%", i32Value);
-    SliderTextSet(&g_sSpeedSlider, buf);
+    prvSendLatestRpmCommand(rpm);
+    prvRefreshSpeedSliderLabel(rpm);
     WidgetPaint((tWidget *)&g_sSpeedSlider);
 }
 
@@ -853,7 +928,8 @@ static void prvRefreshControlStatusLine(void)
         }
     }
     else if (g_state == MOTOR_STATE_STARTING ||
-             g_state == MOTOR_STATE_RUNNING)
+             g_state == MOTOR_STATE_RUNNING ||
+             g_state == MOTOR_STATE_STOPPING)
     {
         usprintf(s_status_line_buf, "Duty %d%% Ready %d Hall %d%d%d",
                  (int)g_pwm_duty,
@@ -926,6 +1002,7 @@ static void prvRedrawWidgets(void)
      * panel paints over the cleared area. */
     static MotorState_t last_state    = (MotorState_t)-1;
     static int32_t      last_rpm      = -1;
+    static int32_t      last_rpm_ref  = -1;
     static int32_t      last_rpm_des  = -1;
     static int32_t      last_pwr_int  = -1;
     static bool         last_is_night = false;
@@ -946,6 +1023,7 @@ static void prvRedrawWidgets(void)
     {
         last_state    = (MotorState_t)-1;
         last_rpm      = -1;
+        last_rpm_ref  = -1;
         last_rpm_des  = -1;
         last_pwr_int  = -1;
         last_is_night = !last_is_night;
@@ -977,6 +1055,7 @@ static void prvRedrawWidgets(void)
             case MOTOR_STATE_IDLE:          name = "Idle";          col = ClrOrange;    break;
             case MOTOR_STATE_STARTING:      name = "Starting";      col = ClrOrange;    break;
             case MOTOR_STATE_RUNNING:       name = "Running";       col = ClrLimeGreen; break;
+            case MOTOR_STATE_STOPPING:      name = "Stopping";      col = ClrOrange;    break;
             case MOTOR_STATE_ESTOP_BRAKING: name = "E-Stop Brake";  col = ClrRed;       break;
             case MOTOR_STATE_FAULT_LATCHED: name = "Fault Latched"; col = ClrRed;       break;
             }
@@ -1005,7 +1084,8 @@ static void prvRedrawWidgets(void)
             prvRefreshControlStatusLine();
         }
         else if (g_state == MOTOR_STATE_STARTING ||
-                 g_state == MOTOR_STATE_RUNNING)
+                 g_state == MOTOR_STATE_RUNNING ||
+                 g_state == MOTOR_STATE_STOPPING)
         {
             static uint16_t last_pwm = 0xFFFFu;
             if (g_pwm_duty != last_pwm)
@@ -1015,14 +1095,16 @@ static void prvRedrawWidgets(void)
             }
         }
 
-        if (g_rpm_actual != last_rpm || g_rpm_desired != last_rpm_des)
+        if (g_rpm_actual != last_rpm || g_rpm_reference != last_rpm_ref ||
+            g_rpm_desired != last_rpm_des)
         {
-            /* Show measured speed and slider target so % control is visible. */
-            usprintf(s_rpm_buf, "%d / %d RPM",
-                     (int)g_rpm_actual, (int)g_rpm_desired);
+            /* Hall / ramp / slider target (RPM). */
+            usprintf(s_rpm_buf, "%d / %d / %d RPM",
+                     (int)g_rpm_actual, (int)g_rpm_reference, (int)g_rpm_desired);
             CanvasTextSet(&g_sRpmText, s_rpm_buf);
             WidgetPaint((tWidget *)&g_sRpmText);
             last_rpm     = g_rpm_actual;
+            last_rpm_ref = g_rpm_reference;
             last_rpm_des = g_rpm_desired;
         }
 
@@ -1211,8 +1293,9 @@ static void prvGuiTask(void *pvParameters)
         while (xQueueReceive(xMotorQueue, &motor_msg, 0) == pdPASS)
         {
             g_state      = motor_msg.state;
-            g_rpm_actual  = motor_msg.rpm_actual;
-            g_rpm_desired = motor_msg.rpm_desired;
+            g_rpm_actual    = motor_msg.rpm_actual;
+            g_rpm_reference = motor_msg.rpm_reference;
+            g_rpm_desired   = motor_msg.rpm_desired;
             g_pwm_duty   = motor_msg.pwm_duty;
             g_fault_bits = motor_msg.fault_bits;
             g_hall_state = motor_msg.hall_state;

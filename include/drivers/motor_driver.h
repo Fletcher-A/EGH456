@@ -16,7 +16,7 @@ void          motor_driver_start(void);
 void          motor_driver_stop(bool brakeHard);
 void          motor_driver_estop(void);
 void          motor_driver_update_commutation(void);
-/* Map commanded RPM (0..4000) to MotorLib PWM microseconds and apply. */
+/* Map commanded RPM (0..MAX_MOTOR_RPM) to MotorLib PWM microseconds and apply. */
 void          motor_driver_set_speed_rpm(int32_t rpm);
 /* Returns PWM duty 0..100 % (for GUI / debug). */
 uint16_t      motor_driver_get_duty_percent(void);

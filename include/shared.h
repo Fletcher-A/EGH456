@@ -27,6 +27,7 @@ typedef enum
     MOTOR_STATE_IDLE = 0,
     MOTOR_STATE_STARTING,
     MOTOR_STATE_RUNNING,
+    MOTOR_STATE_STOPPING,       /* user STOP: ramp down at DECEL_LIMIT_RPMPS */
     MOTOR_STATE_ESTOP_BRAKING,
     MOTOR_STATE_FAULT_LATCHED
 } MotorState_t;
@@ -158,7 +159,8 @@ extern volatile float g_thresh_distance_mm;
  * while Idle. Cleared on STOP/ACK. */
 extern volatile bool g_motor_estop_armed;
 
-/* Minimum RPM applied when START is pressed with the slider at 0%. */
+/* Commanded speed range (GUI slider, motor task, open-loop duty map). */
+#define MAX_MOTOR_RPM              10000
 #define MIN_START_RPM              500
 
 /* Poll DRV8323 nFAULT on PL0 (active low). Set to 1 only after the motor-board

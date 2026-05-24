@@ -23,6 +23,7 @@
 
 #include "drivers/speed_sensor.h"
 #include "drivers/motor_driver.h"
+#include "shared.h"
 
 /*-----------------------------------------------------------*/
 /* Pin assignments. Tune for the BoosterPack you have. */
@@ -174,15 +175,15 @@ void speed_sensor_tick(uint32_t period_ms)
      * alpha = 1/4 gives a ~40 ms time constant at 100 Hz —
      * smooths quantisation noise on slow rotation without
      * adding noticeable lag. */
-    if (rpm_raw > 4000)
+    if (rpm_raw > MAX_MOTOR_RPM)
     {
-        rpm_raw = 4000;
+        rpm_raw = MAX_MOTOR_RPM;
     }
 
     g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 2);
-    if (g_rpm_filt > 4000)
+    if (g_rpm_filt > MAX_MOTOR_RPM)
     {
-        g_rpm_filt = 4000;
+        g_rpm_filt = MAX_MOTOR_RPM;
     }
     else if (g_rpm_filt < 0)
     {

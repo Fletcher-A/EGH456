@@ -8,6 +8,7 @@
 #include "inc/hw_memmap.h"
 #include "drivers/motor_driver.h"
 #include "drivers/speed_sensor.h"
+#include "shared.h"
 #include "utils/uartstdio.h"
 #include "driver_lib/gpio.h"
 #include "driver_lib/sysctl.h"
@@ -15,7 +16,7 @@
 #include "motorlib.h"
 
 #define MOTOR_PWM_PERIOD_US  50u
-#define MOTOR_MAX_COMMAND_RPM 4000
+#define MOTOR_MAX_COMMAND_RPM MAX_MOTOR_RPM
 
 /* EGH456 Motor Adapter v2.2: DRV8323 nFAULT -> PL0 (active low, red LED). */
 #define DRV_NFAULT_PERIPH   SYSCTL_PERIPH_GPIOL

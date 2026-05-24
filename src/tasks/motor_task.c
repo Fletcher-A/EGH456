@@ -11,7 +11,7 @@
  *       50 ms control tick.
  *   xSystemEvents bits:
  *       EVT_USER_START         set by GUI START button     -> Idle  -> Starting
- *       EVT_USER_STOP          set by GUI STOP button      -> any   -> Idle
+ *       EVT_USER_STOP          set by GUI STOP button      -> Running/Starting -> Stopping (500 RPM/s)
  *       EVT_USER_ESTOP_ACK     set by GUI ACK button       -> Fault -> Idle
  *       EVT_ESTOP_POWER        set by sensor task          -> any   -> E-Stop Braking
  *       EVT_ESTOP_ACCEL        set by sensor task          -> any   -> E-Stop Braking
@@ -27,7 +27,7 @@
  *
  * CONTROL NOTES
  * -------------
- *   - State machine: Idle / Starting / Running / E-Stop Braking /
+ *   - State machine: Idle / Starting / Running / Stopping / E-Stop Braking /
  *                    Fault Latched (assignment 2.1.1 spec).
  *   - Reference RPM ramps to desired at 500 RPM/s (1000 in E-Stop).
  *   - Actual RPM comes from hall-sensor feedback.
@@ -72,8 +72,9 @@ static void prvMotorDriverOnStateChange(MotorState_t prev, MotorState_t now)
 #define LOOP_PERIOD_MS  10          /* 100 Hz control; assignment requires 1-10 ms */
 #define SPEED_TICK_MS   10          /* 100 Hz hall-edge-count -> RPM */
 #define ACCEL_PER_TICK  ((ACCEL_LIMIT_RPMPS * LOOP_PERIOD_MS) / 1000)   /* 25 RPM */
+#define DECEL_PER_TICK  ((DECEL_LIMIT_RPMPS * LOOP_PERIOD_MS) / 1000)   /* 25 RPM */
 #define ESTOP_PER_TICK  ((ESTOP_DECEL_LIMIT_RPMPS * LOOP_PERIOD_MS) / 1000) /* 50 RPM */
-#define MAX_COMMAND_RPM 4000
+#define MAX_COMMAND_RPM MAX_MOTOR_RPM
 /* Force Fault Latched if braking does not report 0 RPM (hall noise). */
 #define ESTOP_BRAKE_FAULT_TICKS  100u   /* 1 s at 10 ms loop */
 
@@ -98,7 +99,8 @@ static void prvHandleHardwareDriverFault(MotorState_t *pState,
     *pFaultBits |= EVT_ESTOP_DRIVER;
     g_motor_estop_armed = false;
 
-    if (*pState == MOTOR_STATE_STARTING || *pState == MOTOR_STATE_RUNNING)
+    if (*pState == MOTOR_STATE_STARTING || *pState == MOTOR_STATE_RUNNING ||
+        *pState == MOTOR_STATE_STOPPING)
     {
         *pBrakeTicks = 0;
         *pState = MOTOR_STATE_ESTOP_BRAKING;
@@ -167,12 +169,7 @@ static void prvMotorTask(void *pvParameters)
              * so the motor always follows the most recent slider/start value;
              * state machine decides if/when it's actually applied. */
             rpm_desired = prvClampRpmCommand(newRpm);
-            /* Slider must change motor torque immediately, not via the
-             * 500 RPM/s reference ramp (that only updates the display target). */
-            if (state == MOTOR_STATE_STARTING || state == MOTOR_STATE_RUNNING)
-            {
-                rpm_reference = rpm_desired;
-            }
+            /* rpm_reference ramps toward rpm_desired at ACCEL_LIMIT_RPMPS. */
         }
         if (xCommandMutex != NULL)
         {
@@ -189,13 +186,15 @@ static void prvMotorTask(void *pvParameters)
         if (evt & EVT_USER_STOP)
         {
             rpm_desired = 0;
-            rpm_reference = 0;
-            pwm_duty = 0;
-            state = MOTOR_STATE_IDLE;
-            prvClearFaultLatch();
-            fault_bits = 0;
-            brake_ticks = 0;
-            motor_driver_estop();
+            if (state == MOTOR_STATE_STARTING || state == MOTOR_STATE_RUNNING)
+            {
+                state = MOTOR_STATE_STOPPING;
+            }
+            else if (state == MOTOR_STATE_IDLE)
+            {
+                rpm_reference = 0;
+                pwm_duty = 0;
+            }
             if (xCommandMutex != NULL)
             {
                 xSemaphoreTake(xCommandMutex, portMAX_DELAY);
@@ -283,9 +282,7 @@ static void prvMotorTask(void *pvParameters)
 
         case MOTOR_STATE_STARTING:
             g_motor_estop_armed = false;
-            if (rpm_desired <= 0)             state = MOTOR_STATE_IDLE;
             if (rpm_actual > 100)             state = MOTOR_STATE_RUNNING;
-            if (evt & EVT_USER_STOP)          state = MOTOR_STATE_IDLE;
             if (active_faults)
             {
                 brake_ticks = 0;
@@ -295,8 +292,19 @@ static void prvMotorTask(void *pvParameters)
 
         case MOTOR_STATE_RUNNING:
             g_motor_estop_armed = true;
-            if (rpm_desired <= 0)             state = MOTOR_STATE_IDLE;
-            if (evt & EVT_USER_STOP)          state = MOTOR_STATE_IDLE;
+            if (active_faults)
+            {
+                brake_ticks = 0;
+                state = MOTOR_STATE_ESTOP_BRAKING;
+            }
+            break;
+
+        case MOTOR_STATE_STOPPING:
+            g_motor_estop_armed = false;
+            if (rpm_reference <= 0)
+            {
+                state = MOTOR_STATE_IDLE;
+            }
             if (active_faults)
             {
                 brake_ticks = 0;
@@ -319,14 +327,6 @@ static void prvMotorTask(void *pvParameters)
             break;
         }
 
-        if (state == MOTOR_STATE_IDLE && (evt & EVT_USER_STOP))
-        {
-            rpm_desired = 0;
-            rpm_reference = 0;
-            pwm_duty = 0;
-            g_motor_estop_armed = false;
-        }
-
         prvMotorDriverOnStateChange(prev_state, state);
 
         /* --- 3. Ramp reference toward target ---------------------- */
@@ -339,13 +339,17 @@ static void prvMotorTask(void *pvParameters)
             target = rpm_desired;
             step   = ACCEL_PER_TICK;
             break;
+        case MOTOR_STATE_STOPPING:
+            target = 0;
+            step   = DECEL_PER_TICK;
+            break;
         case MOTOR_STATE_ESTOP_BRAKING:
             target = 0;
             step   = ESTOP_PER_TICK;
             break;
         default:        /* Idle / Fault */
             target = 0;
-            step   = ACCEL_PER_TICK;
+            step   = DECEL_PER_TICK;
             break;
         }
         if (rpm_reference < target)
@@ -359,9 +363,7 @@ static void prvMotorTask(void *pvParameters)
             if (rpm_reference < target) rpm_reference = target;
         }
 
-        /* --- 4. Open-loop duty from slider (rpm_desired -> PWM us). -----
-         * Hall RPM is displayed only; do not zero duty on "overspeed" or the
-         * motor coasts at one speed while the GUI target changes. */
+        /* --- 4. Open-loop duty follows ramped reference. ----- */
         if (state == MOTOR_STATE_IDLE ||
             state == MOTOR_STATE_FAULT_LATCHED ||
             state == MOTOR_STATE_ESTOP_BRAKING)
@@ -371,7 +373,7 @@ static void prvMotorTask(void *pvParameters)
         }
         else
         {
-            motor_driver_set_speed_rpm(rpm_desired);
+            motor_driver_set_speed_rpm(rpm_reference);
             pwm_duty = motor_driver_get_duty_percent();
         }
 
