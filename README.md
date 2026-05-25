@@ -91,8 +91,11 @@ Layout: `src/tasks/` (motor / sensor / gui / fault), `src/drivers/` (i2c, opt300
 
 **Acceleration (BMI160)**
 - [x] `drivers/bmi160.c` over I2C0 (auto-probes 0x68 / 0x69).
-- [x] 200 Hz Timer2A-driven ISR pipeline → AccSamp task → `xAccelRawQueue` → sensor task drain + MAF.
-- [x] Filtered total magnitude triggers `EVT_ESTOP_ACCEL`.
+- [x] 200 Hz Timer2A-driven ISR pipeline → AccSamp task → `xAccelRawQueue` → sensor task drain.
+- [x] **No software filter on the magnitude.** Impacts are single-sample transients; a moving average smears them out and lets a real crash slip below the threshold. The raw `|ax|+|ay|+|az|` is checked directly each cycle.
+- [x] BMI160's on-chip 100 Hz ODR with normal-averaging mode (`ACC_CONF=0x28`) already smooths per-axis noise before the values leave the sensor.
+- [x] Raw total magnitude triggers `EVT_ESTOP_ACCEL`.
+- [x] Bit-set is gated by `g_motor_estop_armed` (true only in Starting / Running / Stopping) so bench handling can't latch a fault while idle.
 
 **Temperature and Humidity (SHT31)**
 - [x] `drivers/sht31.c` over I2C0 at 0x44; proper probe via soft-reset write.
@@ -102,7 +105,10 @@ Layout: `src/tasks/` (motor / sensor / gui / fault), `src/drivers/` (i2c, opt300
 ### 2.2.3 Sensor Filtering
 - [x] All filtering runs inside the sensor task (priority `idle+3`), never in ISRs.
 - [x] ISRs capture raw values into queues; tasks drain and filter.
-- [x] 8-sample MAF on light, acceleration, power. Exp LPF on RPM.
+- [x] **8-sample moving average** on light (smooth, slowly-varying signal).
+- [x] **32-sample moving average** on power (rejects PWM switching noise).
+- [x] **Exponential low-pass** (alpha = 1/4) on RPM (~40 ms time constant; fast follow with quantisation rejection).
+- [x] **No software filter** on the acceleration magnitude — see the Acceleration section above for the justification.
 
 Sampling rates (spec minimum in brackets):
 - [x] Power: **1000 Hz** (≥ 150)

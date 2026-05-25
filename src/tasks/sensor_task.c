@@ -81,9 +81,9 @@ static float    g_fLuxBuf[MAF_WINDOW] = {0};
 static uint8_t  g_ui8LuxIdx = 0;
 static bool     g_bLuxFull  = false;
 
-static float    g_fAccBuf[MAF_WINDOW] = {0};
-static uint8_t  g_ui8AccIdx = 0;
-static bool     g_bAccFull  = false;
+/* No accel filter: impacts are sharp transients that any moving-
+ * average smears out. The raw |ax|+|ay|+|az| feeds the E-Stop check
+ * and the published value directly. */
 
 /* Power filter — 32-sample MAF. At 1 kHz sampling that's a ~32 ms
  * window, fast enough to catch an overcurrent and slow enough to
@@ -112,17 +112,6 @@ static float prvLuxMAFUpdate(float newVal)
     uint8_t count = g_bLuxFull ? MAF_WINDOW : g_ui8LuxIdx;
     float sum = 0.0f;
     for (uint8_t i = 0; i < count; i++) sum += g_fLuxBuf[i];
-    return sum / count;
-}
-
-static float prvAccMAFUpdate(float newVal)
-{
-    g_fAccBuf[g_ui8AccIdx] = newVal;
-    g_ui8AccIdx = (g_ui8AccIdx + 1) % MAF_WINDOW;
-    if (g_ui8AccIdx == 0) g_bAccFull = true;
-    uint8_t count = g_bAccFull ? MAF_WINDOW : g_ui8AccIdx;
-    float sum = 0.0f;
-    for (uint8_t i = 0; i < count; i++) sum += g_fAccBuf[i];
     return sum / count;
 }
 
@@ -348,8 +337,10 @@ static void prvSensorTask(void *pvParameters)
             ay_g = (float)araw.ay_raw / lsb_per_g;
             az_g = (float)araw.az_raw / lsb_per_g;
             raw_total_g = prvAbsF(ax_g) + prvAbsF(ay_g) + prvAbsF(az_g);
-            accel_mag = prvAccMAFUpdate(raw_total_g);
-
+            /* Impact is a sharp spike: any averaging window smears it
+             * out, so we threshold the raw magnitude directly. Lux gets
+             * the 8-tap MAF instead (it's slowly varying). */
+            accel_mag = raw_total_g;
         }
         if (g_motor_estop_armed && accel_mag > g_thresh_accel_g)
         {
