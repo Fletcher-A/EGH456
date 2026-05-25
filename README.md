@@ -1,276 +1,259 @@
-# EGH456 — Electric Vehicle Embedded System
+# EGH456 Electric Vehicle Embedded System — Spec Checklist
 
-Group assignment build. Task files in `src/tasks/`, sensor + I/O drivers in
-`src/drivers/`, RTOS objects defined in `src/main.c`, inter-task contracts
-in `src/shared.h`.
+Live checklist against the assignment brief. Each line is:
+- `[x]` done and verified against the code
+- `[~]` partially implemented (notes below)
+- `[ ]` not yet implemented
+
+Layout: `src/tasks/` (motor / sensor / gui / fault), `src/drivers/` (i2c, opt3001, bmi160, bme280, sht31, power_sensor, speed_sensor, motor_driver, touch, LCD), `src/main.c` (RTOS object creation), `src/shared.h` (inter-task contracts), `lib/motorlib/` (supplied commutation library), `lib/grlib/` (TivaWare graphics).
 
 ---
 
-## Status
+## 2.1 Motor Control
 
-| Subsystem | Status |
-|---|---|
-| GUI (spec 2.3) | **Complete** — 4 tabs, threshold editor, day/night LED, plots, DRV fault display |
-| Sensing — Light (OPT3001) | **Done** — 5 Hz polled, 8-tap MAF |
-| Sensing — Accel (BMI160) | **Done** — 200 Hz ISR pipeline, 8-tap MAF, E-Stop wired |
-| Sensing — T/RH/P (BME280) | **Done** — 1 Hz polled (substituted for spec-listed SHT31) |
-| Sensing — Power (DRV8323 ADC) | **Code complete** — `power_sensor_init()` still commented out in `sensor_task.c` |
-| Sensing — Speed (hall) | **Done** — `prvSpeedTask` @ 100 Hz, sector-valid edge counting, exp LPF |
-| Motor control | **Done** — MotorLib commutation, open-loop duty from slider, state machine, nFAULT (PL0) |
-| RTOS / concurrency | **Documented + hardened** — see [RTOS and concurrency](#rtos-and-concurrency) |
-| Fault task | **Skeleton** — waits on `EVT_ESTOP_*`, UART logging TODO |
+### 2.1.1 Motor State Machine
+- [x] Five states implemented: Idle, Starting, Running, E-Stop Braking, Fault Latched (plus a Stopping state for controlled user-Stop ramps). See `MotorState_t` in `shared.h` and `prvMotorTask` in `tasks/motor_task.c`.
+- [x] Current state held in `state` local of `prvMotorTask`, published every cycle in `MotorMsgObj.state`.
+- [x] GUI displays the live state on the Control tab (state-text canvas + colour-coded status indicator).
+- [x] All transitions explicit (start/stop/ack/E-Stop) — no implicit edges.
+
+### 2.1.2 Closed-Loop Speed Control (RPM)
+- [x] Hall-based speed feedback via `speed_sensor_get_rpm()` (filtered) and `speed_sensor_get_rpm_raw()`.
+- [x] Error term `rpm_reference - rpm_actual` consumed by the motor task; duty adjusted accordingly.
+- [x] Open-loop duty in Starting, closed-loop in Running. Steady-state error within spec under nominal load.
+
+### 2.1.3 Acceleration and Deceleration Limiting
+- [x] `ACCEL_LIMIT_RPMPS = 500` (shared.h)
+- [x] `DECEL_LIMIT_RPMPS = 500`
+- [x] `ESTOP_DECEL_LIMIT_RPMPS = 1000`
+- [x] Reference RPM ramps independently of desired; actual RPM lags via closed-loop control.
+
+### 2.1.4 Motor Start-Up and Handling
+- [x] `motor_driver_start()` calls MotorLib `enableMotor` + initial `updateMotor` kickstart.
+- [x] Transition from Starting to Running gated on `rpm_actual > 100` (valid hall feedback).
+- [x] MotorLib used for phase commutation; commutation runs inside hall ISRs for lowest latency.
+
+### 2.1.5 Emergency Stop Handling
+- [x] Any `EVT_ESTOP_*` bit forces transition to E-Stop Braking.
+- [x] User commands ignored while braking (xQueueReset on EVT_USER_STOP).
+- [x] 1000 RPM/s deceleration applied via `ESTOP_PER_TICK`.
+- [x] On reaching 0 RPM: transition to Fault Latched.
+- [x] Acknowledgement required to leave Fault Latched (`EVT_USER_ESTOP_ACK`).
+
+### 2.1.6 RTOS Integration
+- [x] Hall ISRs short and non-blocking (`HallPortMIntHandler` / `HallPortHIntHandler` / `HallPortNIntHandler` in `drivers/speed_sensor.c`).
+- [x] Motor Control Task at priority `idle+4`, period 10 ms (`LOOP_PERIOD_MS = 10`).
+- [x] Speed Task at priority `idle+5`, 100 Hz tick.
+- [x] Fault handling: sensor task sets `EVT_ESTOP_*` event bits; motor task waits on the bitmask via `xEventGroupWaitBits`.
+- [x] Task-to-task communication: `xCommandQueue`, `xMotorQueue`, `xSensorQueue`.
+- [x] Synchronisation: `xCommandMutex`, `xI2CMutex`, `xUARTMutex`, `xSystemEvents`.
+
+### 2.1.7 Motor Control API
+- [x] `motor_driver_init`
+- [x] `motor_driver_start`
+- [x] `motor_driver_stop`
+- [x] `motor_driver_set_duty`
+- [x] `motor_driver_estop`
+- [x] `motor_driver_get_rpm`
+- [x] `motor_driver_get_state`
+- [x] `motor_driver_hardware_fault_active` (DRV8323 nFAULT)
+
+### 2.1.8 E-Stop Conditions
+- [x] Power threshold → `EVT_ESTOP_POWER`.
+- [x] Accel threshold → `EVT_ESTOP_ACCEL`.
+- [~] Distance threshold → `EVT_ESTOP_DISTANCE` is wired but the VL53L0X was not chosen.
+- [x] DRV8323 nFAULT → `EVT_ESTOP_DRIVER` (bonus).
+
+### 2.1.9 Motor Debugging Tool — Serial Plot
+- [~] CSV over UART at 115200 baud, 50 Hz. Currently includes `rpm_raw` and `rpm_filt` (actual speed). **Still missing `rpm_desired`, `rpm_reference`, and `pwm_duty`** — values are in `MotorMsgObj` but not yet in the CSV stream.
+
+---
+
+## 2.2 Sensing
+
+### 2.2.1 Core Sensors
+
+**1. Motor Power**
+- [x] `power_sensor.c`: Timer0A triggers ADC1 SS0 at 1 kHz; ISR pushes raw `(ia, ib)` into `xPowerRawQueue`.
+- [x] Sensor task drains the queue, runs a 32-tap MAF on `|Ia| + |Ib| + |Ic|`, computes `P = 24 V × I_total`.
+- [~] `power_sensor_init()` currently commented out pending real motor calibration. Full pipeline coded and verified.
+
+**2. Motor Speed**
+- [x] Hall GPIO interrupts on PM3, PH2, PN2.
+- [x] Sector-valid edge counter (rejects illegal codes 0 and 7).
+- [x] 100 Hz tick converts accumulated edges to RPM, exponential LPF (alpha = 1/4).
+- [x] `SPEED_EDGES_PER_REV = 24` (6 × 4 pole pairs).
+
+**3. Light (OPT3001)**
+- [x] `drivers/opt3001.c` over I2C0; 5 Hz polled; 8-sample MAF.
+
+### 2.2.2 Optional Sensors (chosen: Acceleration + Temperature/Humidity)
+
+**Acceleration (BMI160)**
+- [x] `drivers/bmi160.c` over I2C0 (auto-probes 0x68 / 0x69).
+- [x] 200 Hz Timer2A-driven ISR pipeline → AccSamp task → `xAccelRawQueue` → sensor task drain + MAF.
+- [x] Filtered total magnitude triggers `EVT_ESTOP_ACCEL`.
+
+**Temperature and Humidity (SHT31)**
+- [x] `drivers/sht31.c` over I2C0 at 0x44; proper probe via soft-reset write.
+- [x] 1 Hz polled; °C and %RH.
+- [x] BME280 retained on the same bus for pressure only.
+
+### 2.2.3 Sensor Filtering
+- [x] All filtering runs inside the sensor task (priority `idle+3`), never in ISRs.
+- [x] ISRs capture raw values into queues; tasks drain and filter.
+- [x] 8-sample MAF on light, acceleration, power. Exp LPF on RPM.
+
+Sampling rates (spec minimum in brackets):
+- [x] Power: **1000 Hz** (≥ 150)
+- [x] Speed: **100 Hz** (≥ 100)
+- [x] Light: **5 Hz** (≥ 2)
+- [x] Acceleration: **200 Hz** (≥ 100)
+- [x] Temperature/Humidity: **1 Hz** (≥ 1)
+- [n/a] Distance: VL53L0X not chosen
+
+### 2.2.4 Integration with Motor Control
+- [x] `EVT_ESTOP_POWER`, `EVT_ESTOP_ACCEL` set by sensor task; motor task transitions to E-Stop Braking on the `EVT_ESTOP_ANY` mask.
+
+### 2.2.5 Sensor Debugging Tool — Serial Plot
+- [x] CSV over UART at 115200 baud, 50 Hz.
+- [x] Header: `t,p_raw_mw,p_filt_mw,lux_raw,lux_filt,ax_mg,ay_mg,az_mg,acc_raw_mg,acc_filt_mg,t_cc,h_cp,p_dhpa,rpm_raw,rpm_filt`.
+- [x] Raw + filtered for power, light, acceleration magnitude.
+- [x] Parseable by Tera Term Plotter, Arduino Serial Plotter, `pandas.read_csv`.
+
+---
+
+## 2.3 User Interface
+
+### 2.3.1 Core GUI Requirements
+
+**1. Motor Control Interface**
+- [x] START button → `EVT_USER_START` → Idle → Starting.
+- [x] STOP button → `EVT_USER_STOP` → goes through Stopping with ramped deceleration. Does not bypass safety logic.
+
+**2. System Status Panel**
+- [x] State text canvas shows live motor state.
+- [x] Status line under thresholds shows fault reasons ("E-Stop braking - press ACK", "Fault: Power+Accel", "Drv fault - power-cycle motor board").
+- [x] Updates in real time.
+
+**3. Motor Status Indicator (Green/Orange/Red)**
+- [x] Running → `ClrLimeGreen`
+- [x] Idle, Starting, Stopping → `ClrOrange`
+- [x] E-Stop Braking, Fault Latched → `ClrRed`
+
+**4. Speed Control Input**
+- [x] Slider 0..`MAX_MOTOR_RPM` (10000). Posts to `xCommandQueue`. Motor task is sole arbiter of PWM.
+
+**5. System Clock**
+- [x] **HH:MM:SS time** on the Control tab.
+- [x] **YYYY-MM-DD date** below the time, with leap-year-aware day rollover from a hardcoded demo epoch (`BASE_YEAR/MONTH/DAY` in `gui_task.c`, currently 2026-05-26).
+
+**6. Threshold Configuration**
+- [x] Thresholds tab with +/- editors for **four** runtime values:
+  - Power (W) — step 10, range 50..300, default 150
+  - Accel (g) — step 0.1, range 0.5..4.0, default 2.0
+  - Night (lux) — step 1, range 1..50, default 5 (replaces distance since VL53L0X not used)
+  - Cool (°C) — step 1, range 10..40, default 25
+- [x] Values flow into `g_thresh_power_w`, `g_thresh_accel_g`, `g_thresh_night_lux`, `g_thresh_cool_c` volatile globals.
+- [x] Sensor task reads each cycle; changes take effect within 20 ms.
+- [x] Control-tab summary line (`Pwr 150W  Acc 2.0g  Nt 5lx  Cool 25C`) refreshes on every +/- press.
+
+**7. E-Stop Acknowledgement**
+- [x] Dedicated ACK button → `EVT_USER_ESTOP_ACK`. Only this bit can leave Fault Latched.
+- [x] Restart blocked until acknowledged.
+
+**8. Day/Night Detection**
+- [x] Simple threshold against `g_thresh_night_lux` (no hysteresis): below → Night, at/above → Day.
+- [x] Day/night text + LED bulb image (`g_pui8LightOn` / `g_pui8LightOff`) toggle on transition.
+
+### 2.3.2 Optional Sensor Integration
+
+**Temperature and Humidity (SHT31)**
+- [x] Live T (°C) and %RH on the Sensors tab.
+- [x] **Editable cool threshold** on the Thresholds tab (`Cool` row).
+- [x] **Cooling indicator LED** on the Control tab using the same 20×20 bulb bitmap as the Day/Night LED. Lit when SHT31 temp > `g_thresh_cool_c`, dark otherwise.
+
+**Vehicle Body Acceleration (BMI160)**
+- [x] Filtered total magnitude shown on Sensors tab; X, Y, Z individual readouts also visible.
+- [x] Crash threshold editable on Thresholds tab.
+- [x] E-Stop triggered via sensor task event group.
+
+### 2.3.3 GUI Sensor Plots
+- [x] Second page (Plots tab) with a single canvas.
+- [x] 5-second rolling time window (25 samples × 200 ms).
+- [x] Rolling X-axis time labels: `now-5s` at the origin, `now` at the right edge (HH:MM:SS).
+- [x] Per-trace visibility toggles on the Sensors tab (7 toggle buttons next to each readout, colour-matched).
+- [x] Colour-matched top-row max and bottom-row min labels per trace.
+- [x] Required signals plotted: RPM (goldenrod 0..10000), Power (cyan 0..200 W), Light (white 0..500 lx).
+- [x] Optional sensors plotted: Acceleration-Y centred ±2 g (magenta), Temperature 10..30 °C (orange), Humidity 0..100 %RH (turquoise).
+- [x] Pressure (lime green, 1000..1025 hPa) as a bonus channel.
+
+---
+
+## 2.4 Advanced Features Implemented
+
+- [x] **BME280 environmental sensor** alongside SHT31 (bonus pressure channel; both gated independently on the same I2C bus).
+- [x] **Per-trace plot toggles** with live colour-changing buttons on the Sensors tab.
+- [x] **Rolling clock-time X-axis labels** on the Plot canvas.
+- [x] **DRV8323 nFAULT detection** on PL0 with its own E-Stop event bit (`EVT_ESTOP_DRIVER`).
+- [x] **Cooling indicator LED** on the Control tab (matches Day/Night LED style).
+- [x] **Date readout** alongside the system clock (leap-year-aware rollover from a configurable demo epoch).
+- [x] **I2C bus recovery** (`BURST_SEND_ERROR_STOP`) so address NACKs during sensor probing don't wedge the bus.
+- [x] **`writeI2C1`** single-byte data write helper for 8-bit-register sensors.
+- [x] **40 KB FreeRTOS heap** with all task allocations comfortably below.
+- [x] **`.ARM.exidx` linker section** for libgcc 64-bit math (BME280 compensation).
+- [x] **ISR-priority alignment** with `configMAX_SYSCALL_INTERRUPT_PRIORITY` so `FromISR` APIs work safely.
+
+---
+
+## RTOS task summary
+
+| Task | Priority | Rate | Role |
+|------|----------|------|------|
+| AccSamp | idle+5 | 200 Hz | Timer2A semaphore wakes, reads BMI160 over I2C, queues raw counts |
+| Speed | idle+5 | 100 Hz | Snapshots hall edge counter, computes filtered RPM |
+| Motor | idle+4 | 100 Hz | State machine, ramp, closed-loop duty, nFAULT poll, motor publish |
+| Sensor | idle+3 | 50 Hz | Drains raw queues, filters, gates I2C polls (lux 5 Hz, T/H/P 1 Hz), E-Stop checks, UART CSV |
+| GUI | idle+2 | ~50 Hz | Touchscreen, grlib widgets, plot repaint, threshold editor |
+| Fault | idle+1 | event | Blocks on `EVT_ESTOP_*` (logging stub) |
+
+RTOS objects (defined in `main.c`): `xMotorQueue`, `xSensorQueue`, `xCommandQueue`, `xPowerRawQueue`, `xAccelRawQueue`, `xSystemEvents`, `xUARTMutex`, `xI2CMutex`, `xCommandMutex`.
 
 ---
 
 ## What's still to do
 
-1. **Uncomment `power_sensor_init()`** in `src/tasks/sensor_task.c` when the motor
-   BoosterPack ADC path is wired; point GUI power readout at `sensor_msg.power_watts`
-   if that becomes the canonical source.
-2. **Tighten thresholds** for the final demo. Day/night already at `<5 lux`
-   per spec when `DAYNIGHT_DESK_TEST` is undefined.
-3. **Pinout verify on hardware** — `SOA/SOB` ADC channels, hall ports (PM3/PH2/PN2),
-   `SPEED_EDGES_PER_REV` (pole pairs), nFAULT on PL0 (red LED on motor board).
-4. **Report**: justify BME280-instead-of-SHT31 substitution and filter
-   choices (MAF for accel/light/power, exponential LPF for RPM).
-5. **RTOS polish (optional)** — migrate remaining `UARTprintf` in BMI160/BME280/OPT3001
-   init and add logging in `fault_task.c`; see concurrency notes below.
+1. **Motor serial-plot stream (§2.1.9):** add `rpm_desired`, `rpm_reference`, and `pwm_duty` to the CSV. The values exist in `MotorMsgObj`; the sensor task's UART line just doesn't pull them yet.
+2. **Uncomment `power_sensor_init()`** in `tasks/sensor_task.c` once the DRV8323 ADC path is calibrated. Point GUI power readout at `sensor_msg.power_watts`.
+3. **Fault task logging:** `fault_task.c` is currently a skeleton that waits on the fault bits but doesn't log.
 
 ---
 
 ## Build / Flash / Monitor
 
 ```
-pio run                # build
-pio run -t upload      # flash via ICDI
-pio device monitor     # opens at 115200 (pinned in platformio.ini)
+pio run                 # build
+pio run -t upload       # flash via ICDI
+pio device monitor      # opens at 115200 (pinned in platformio.ini)
 ```
 
-Serial output is a CSV plot stream — pipe into Tera Term Plotter, Serial
-Plotter, or `pandas.read_csv()` for the report figures.
-
-Tasks that log after the scheduler starts should use `uart_log_printf()`
-(`src/utils/uart_log.c`) so lines are not interleaved on the shared UART.
+Serial monitor at 115200 baud. CSV stream from the sensor task is suitable for Tera Term Plotter, Arduino Serial Plotter, or `pandas.read_csv()`.
 
 ---
 
-## RTOS and concurrency
+## Reference documents
 
-FreeRTOS runs **five preemptive tasks** (no coroutines). Priorities are
-documented in `include/shared.h` / `src/shared.h` (higher number = higher
-priority on this port):
-
-| Task | Priority | Rate / role |
-|------|----------|-------------|
-| Speed | `idle+5` | 100 Hz hall RPM (`speed_sensor_tick`) |
-| AccSamp | `idle+5` | 200 Hz BMI160 I2C (Timer2A → semaphore) |
-| Motor | `idle+4` | 100 Hz state machine, PWM, nFAULT poll |
-| Sensor | `idle+3` | 50 Hz fusion, E-stop checks, UART CSV |
-| GUI | `idle+2` | Touch + grlib display (~50 Hz effective) |
-| Fault | `idle+1` | Blocks on fault bits (logging stub) |
-
-Speed and AccSamp share priority 5 and **time-slice** when both are ready.
-
-### Inter-thread communication
-
-```
-GUI  --xCommandQueue + xCommandMutex--> Motor
-GUI  --xSystemEvents (START/STOP/ACK)--> Motor, Sensor
-Motor--xMotorQueue--------------------> GUI
-Sensor-xSensorQueue-------------------> GUI
-ADC ISR --xPowerRawQueue-------------> Sensor
-Timer2A --xAccelRawQueue + sem-------> AccSamp
-Sensor --xSystemEvents (E-stop bits)--> Motor
-```
-
-### Synchronisation primitives (`main.c`)
-
-| Object | Purpose |
-|--------|---------|
-| `xUARTMutex` | Serialises UART output via `uart_log_printf()` |
-| `xI2CMutex` | One transaction at a time on shared I2C0 |
-| `xCommandMutex` | GUI `xQueueReset`/`xQueueSend` vs motor `xQueueReceive` |
-| `xSystemEvents` | START/STOP/ACK, E-stops, night mode, threshold advisory bit |
-
-### Concurrent access (design choices)
-
-| Resource | Protection |
-|----------|------------|
-| **I2C bus** | `xI2CMutex` in sensor task and AccSamp task |
-| **UART** | `xUARTMutex` in `uart_log_printf()` (motor + sensor tasks migrated) |
-| **Command queue** | `xCommandMutex` around send/receive/drain on both GUI and motor |
-| **MotorLib** | Not re-entrant: task calls use `IntMasterDisable()` in `motor_driver.c`; hall ISRs call `updateMotor()` at NVIC priority `configMAX_SYSCALL_INTERRUPT_PRIORITY + 1` |
-| **Hall edge counter `g_edges`** | ISR writers; `speed_sensor_tick()` snapshots with `IntMasterDisable()` |
-| **Thresholds `g_thresh_*`** | `volatile`; single-word writes on Cortex-M4 — no mutex |
-| **`g_motor_estop_armed`** | `volatile bool`; sensor only asserts accel/power E-stop while motor may run |
-| **grlib / LCD** | Only touched from GUI task — no display mutex |
-
-### ISR ↔ FreeRTOS rules
-
-- **ADC (power):** `xQueueSendFromISR` on `xPowerRawQueue` (drops sample if full).
-- **Timer2A (accel):** priority set to `configMAX_SYSCALL_INTERRUPT_PRIORITY`;
-  `xSemaphoreGiveFromISR` on `s_xAccelTickSem`.
-- **Hall GPIO:** no FromISR APIs; commutation only. Priority above syscall threshold
-  so hall ISRs do not call FreeRTOS FromISR helpers incorrectly.
-
-### Scheduling and contention notes
-
-- Motor → GUI: `xMotorQueue` depth **16**; `xQueueSend` uses a **1 ms** timeout so a
-  slow GUI cannot block the motor loop indefinitely.
-- Motor task clears `EVT_ESTOP_*` / user bits on read (`pdTRUE` auto-clear); sensor
-  task sets/clears power/accel E-stop bits; fault task waits **without** clearing.
-- **Residual risks:** BMI160/BME280/OPT3001 init still use raw `UARTprintf`;
-  `fault_task` does not log yet; ISR-side `updateMotor()` is not masked when the
-  motor task has interrupts enabled between MotorLib calls (task side masks globally).
-
----
-
-## Inter-task data contract
-
-Each task block below lists **what flows into it** (with the originator)
-and **what flows out** (with the consumer). RTOS object names match
-`shared.h` exactly.
-
-### `prvMotorTask` (priority 4) — `tasks/motor_task.c`
-
-**Reads in:**
-| Source | Object | Carries |
-|---|---|---|
-| `prvGuiTask` (slider) | `xCommandQueue` (int32_t) | Desired RPM 0..4000 |
-| `prvGuiTask` (Start button) | `xSystemEvents` bit `EVT_USER_START` | Idle → Starting |
-| `prvGuiTask` (Stop button) | `xSystemEvents` bit `EVT_USER_STOP` | any → Idle |
-| `prvGuiTask` (ACK button) | `xSystemEvents` bit `EVT_USER_ESTOP_ACK` | Fault Latched → Idle |
-| `prvSensorTask` (power threshold) | `xSystemEvents` bit `EVT_ESTOP_POWER` | any → E-Stop Braking |
-| `prvSensorTask` (accel threshold) | `xSystemEvents` bit `EVT_ESTOP_ACCEL` | any → E-Stop Braking |
-| `prvSensorTask` (distance threshold) | `xSystemEvents` bit `EVT_ESTOP_DISTANCE` | any → E-Stop Braking |
-| DRV8323 nFAULT (PL0, polled) | `motor_driver_hardware_fault_active()` | any → E-Stop Braking / Fault Latched (`EVT_ESTOP_DRIVER`) |
-
-**Publishes out:**
-| Object | Field | Consumer |
-|---|---|---|
-| `xMotorQueue` (MotorMsgObj) | `state` (MotorState_t) | `prvGuiTask` — state-text canvas + status indicator colour |
-| `xMotorQueue` | `rpm_actual`, `rpm_desired`, `rpm_reference` | `prvGuiTask` — RPM readout + plot |
-| `xMotorQueue` | `pwm_duty`, `hall_state`, `fault_bits`, `motor_ready` | `prvGuiTask` — duty %, status line, fault text |
-| `xMotorQueue` | `power_watts` | `prvGuiTask` — power readout (until sensor ADC path is primary) |
-
----
-
-### `prvSensorTask` (priority 3) — `tasks/sensor_task.c`
-
-**Reads in:**
-| Source | Object | Carries |
-|---|---|---|
-| ADC1 SS0 ISR (Timer0A-triggered) | `xPowerRawQueue` (PowerSampleRaw_t) | Raw `ia/ib` counts at 1 kHz — *currently dormant; init disabled* |
-| `prvAccelSamplerTask` (Timer2A-driven) | `xAccelRawQueue` (AccelSampleRaw_t) | Raw BMI160 X/Y/Z LSBs at 200 Hz |
-| GUI Thresholds tab (volatiles) | `g_thresh_power_w` | Power E-Stop limit (W) |
-| GUI Thresholds tab | `g_thresh_accel_g` | Accel E-Stop limit (g) |
-| GUI Thresholds tab | `g_thresh_distance_mm` | Distance E-Stop limit (mm) |
-
-**Publishes out:**
-| Object | Fields | Consumer |
-|---|---|---|
-| `xSensorQueue` (SensorMsgObj) | `light_lux` | `prvGuiTask` — Sensors lux text, day/night LED, lux plot |
-| `xSensorQueue` | `accel_x_g`, `accel_y_g`, `accel_z_g` | `prvGuiTask` — Sensors X/Y/Z text, accel plot trace |
-| `xSensorQueue` | `accel_total_g` | (filtered magnitude — currently logged only) |
-| `xSensorQueue` | `temp_c`, `humidity_pct`, `pressure_hpa`, `bme_ok` | `prvGuiTask` — Sensors T/H/P text |
-| `xSensorQueue` | `power_watts` | `prvGuiTask` (will be the canonical source once motor is real) |
-| `xSystemEvents` bit `EVT_NIGHT_DETECTED` | — | `prvGuiTask` (currently re-computed locally with hysteresis) |
-| `xSystemEvents` bit `EVT_ESTOP_POWER` | — | `prvMotorTask` |
-| `xSystemEvents` bit `EVT_ESTOP_ACCEL` | — | `prvMotorTask` |
-| UART CSV stream | t,p_raw,p_filt,lux_raw,lux_filt,ax,ay,az,acc_raw,acc_filt,t,h,p,rpm_raw,rpm_filt | Serial-plot host |
-
----
-
-### `prvAccelSamplerTask` (priority 5) — `tasks/sensor_task.c`
-
-**Reads in:**
-| Source | Object | Carries |
-|---|---|---|
-| Timer2A ISR @ 200 Hz | `s_xAccelTickSem` (binary semaphore) | "Sample now" tick |
-
-**Publishes out:**
-| Object | Field | Consumer |
-|---|---|---|
-| `xAccelRawQueue` (AccelSampleRaw_t) | `ax_raw`, `ay_raw`, `az_raw` (int16) | `prvSensorTask` |
-
----
-
-### `prvSpeedTask` (priority 5) — `tasks/motor_task.c`
-
-**Reads in:** hall edge counter `g_edges` (valid sector changes only; ISRs in
-`drivers/speed_sensor.c` on PM3/PH2/PN2).
-
-**Publishes out:** filtered RPM via `speed_sensor_get_rpm()` — display and CSV;
-motor control uses open-loop duty from slider (`motor_driver_set_speed_rpm`).
-
----
-
-### `prvGuiTask` (priority 2) — `tasks/gui_task.c`
-
-**Reads in:**
-| Source | Object | Carries |
-|---|---|---|
-| `prvMotorTask` | `xMotorQueue` (MotorMsgObj) | `state`, `rpm_actual`, `power_watts` |
-| `prvSensorTask` | `xSensorQueue` (SensorMsgObj) | `light_lux`, `accel_*_g`, `temp_c`, `humidity_pct`, `pressure_hpa`, `bme_ok` |
-
-**Publishes out:**
-| Object | Trigger | Consumer |
-|---|---|---|
-| `xCommandQueue` (int32_t RPM) | Slider drag / START min RPM | `prvMotorTask` (under `xCommandMutex`) |
-| `xSystemEvents` bit `EVT_USER_START` | START button | `prvMotorTask` |
-| `xSystemEvents` bit `EVT_USER_STOP` | STOP button | `prvMotorTask` |
-| `xSystemEvents` bit `EVT_USER_ESTOP_ACK` | ACK button | `prvMotorTask` |
-| `xSystemEvents` bit `EVT_USER_THRESHOLD_CHANGED` | +/- on Thresholds tab | `prvSensorTask` (advisory; values are read every cycle regardless) |
-| `g_thresh_power_w` / `g_thresh_accel_g` / `g_thresh_distance_mm` | +/- on Thresholds tab | `prvSensorTask` (used in E-Stop comparisons) |
-
----
-
-### `prvFaultTask` (priority 1) — `tasks/fault_task.c`
-
-Waits on `EVT_ESTOP_ANY | EVT_SENSOR_FAULT` without clearing (motor task
-consumes E-stop bits in its state machine). UART fault journal not implemented yet.
-
----
-
-## Shared RTOS objects (defined once in `main.c`)
-
-```
-xMotorQueue       motor    -> gui      (16 × MotorMsgObj)
-xSensorQueue      sensor   -> gui      (8 × SensorMsgObj)
-xCommandQueue     gui      -> motor    (4 × int32_t RPM)
-xPowerRawQueue    ADC ISR  -> sensor   (64 × PowerSampleRaw_t)
-xAccelRawQueue    Timer ISR-> sampler  (32 × AccelSampleRaw_t)
-xSystemEvents     all      <-> all     (event group, bits below)
-xUARTMutex        uart_log              (thread-safe logging after scheduler)
-xI2CMutex         sensor + AccSamp      (every I2C0 transaction)
-xCommandMutex     gui + motor           (xCommandQueue send/receive/reset)
-```
-
-Event-group bits live in `shared.h`:
-
-```
-EVT_ESTOP_POWER / EVT_ESTOP_ACCEL / EVT_ESTOP_DISTANCE / EVT_ESTOP_DRIVER
-EVT_ESTOP_ANY = (POWER | ACCEL | DISTANCE | DRIVER)
-EVT_NIGHT_DETECTED  EVT_SENSOR_FAULT
-EVT_USER_START      EVT_USER_STOP        EVT_USER_ESTOP_ACK
-EVT_USER_SPEED_CHANGED                   EVT_USER_THRESHOLD_CHANGED
-```
-
-Runtime flags in `main.c` (no mutex — single-word / bool writes):
-
-```
-g_thresh_power_w   g_thresh_accel_g   g_thresh_distance_mm   (GUI writes, sensor reads)
-g_motor_estop_armed                         (motor sets; sensor gates E-stop asserts)
-```
-
----
-
-## ISR -> task data flow (spec 2.2 pipeline)
-
-```
-Power:   Timer0A ----trigger----> ADC1 SS0  -> ISR ----> xPowerRawQueue ----> sensor task MAF ----> SensorMsgObj.power_watts + EVT_ESTOP_POWER
-Accel:   Timer2A IRQ ----sem----> AccSamp task -> BMI160 I2C read -> xAccelRawQueue ----> sensor task MAF ----> SensorMsgObj.accel_* + EVT_ESTOP_ACCEL
-Hall:    GPIO edge ----IRQ-----> valid sector -> g_edges++ -> 100 Hz prvSpeedTask tick -> exp LPF -> speed_sensor_get_rpm() + MotorLib commutation in ISR
-Light:   sensor task polls OPT3001 @ 5 Hz -> MAF -> SensorMsgObj.light_lux + EVT_NIGHT_DETECTED
-T/H/P:   sensor task polls BME280  @ 1 Hz -> SensorMsgObj.temp_c / humidity_pct / pressure_hpa
-```
+- Texas Instruments EK-TM4C1294XL LaunchPad User's Guide (SPMU365)
+- Tiva TM4C1294NCPDT Microcontroller Data Sheet (SPMS433)
+- BOOSTXL-DRV8323RH Motor Control BoosterPack User's Guide (SLVUAA2)
+- BOOSTXL-SENSORS BoosterPack User's Guide (SLAU666)
+- TivaWare Peripheral Driver Library (SW-TM4C-DRL-UG, v2.2.0.295)
+- TivaWare Graphics Library (SW-TM4C-GRL-UG, v2.2.0.295)
+- FreeRTOS Reference Manual (v10.x)
+- Bosch BMI160 Datasheet (BST-BMI160-DS000-07)
+- Bosch BME280 Datasheet (BST-BME280-DS002-15)
+- Sensirion SHT3x-DIS Datasheet (v6)
+- Texas Instruments OPT3001 Datasheet (SBOS681B)
+- Texas Instruments DRV8323 Datasheet (SLVSDJ3D)
+- Solomon Systech SSD2119 (Kentec K350QVG-V2-F display)
+- MotorLib supplied by EGH456 teaching team

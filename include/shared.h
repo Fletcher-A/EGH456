@@ -153,6 +153,8 @@ extern SemaphoreHandle_t  xCommandMutex; /* serialises xCommandQueue access */
 extern volatile float g_thresh_power_w;
 extern volatile float g_thresh_accel_g;
 extern volatile float g_thresh_distance_mm;
+extern volatile float g_thresh_night_lux;     /* day/night cut-off */
+extern volatile float g_thresh_cool_c;        /* cooling-on threshold (deg C) */
 
 /* True while motor may run (Starting/Running). Sensor task only asserts
  * EVT_ESTOP_* when this is set so bench vibration cannot latch a fault

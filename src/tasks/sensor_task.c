@@ -423,7 +423,7 @@ static void prvSensorTask(void *pvParameters)
         }
 
         /* ---- Serial plot: one CSV line per tick (50 Hz). */
-        uart_log_printf("%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        uart_log_printf("%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                         (unsigned)tick_count,
                         (int)(i_total_raw * POWER_SENSOR_VOLTAGE_V * 1000),
                         (int)(power_w * 1000),

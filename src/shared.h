@@ -136,6 +136,8 @@ extern SemaphoreHandle_t  xCommandMutex;
 extern volatile float g_thresh_power_w;
 extern volatile float g_thresh_accel_g;
 extern volatile float g_thresh_distance_mm;
+extern volatile float g_thresh_night_lux;     /* day/night cut-off */
+extern volatile float g_thresh_cool_c;        /* cooling-on threshold (deg C) */
 
 extern volatile bool g_motor_estop_armed;
 
