@@ -47,7 +47,41 @@
 static volatile uint32_t g_edges = 0;     /* hall sector changes per tick window */
 static volatile int32_t  g_rpm_raw  = 0;
 static volatile int32_t  g_rpm_filt = 0;
+static volatile int32_t  g_rpm_display = 0; /* extra-smoothed RPM for GUI/plot */
+static uint32_t          s_disp_edges_sum = 0;
+static uint8_t           s_disp_integ_cnt = 0;
+static uint32_t          s_ctrl_edges_sum = 0;
+static uint8_t           s_ctrl_integ_cnt = 0;
 static uint8_t           s_hall_prev = 0xFF;  /* force first sample to count */
+static bool              s_hall_irq_on = true;
+
+static void prvRpmDisplayUpdate(int32_t rpm_meas)
+{
+    int32_t d = rpm_meas - g_rpm_display;
+    int32_t cap = 80;
+    if (g_motor_state == MOTOR_STATE_RUNNING)
+    {
+        cap = 40;
+    }
+    if (d > cap)
+    {
+        d = cap;
+    }
+    else if (d < -cap)
+    {
+        d = -cap;
+    }
+    g_rpm_display += d >> 3;
+
+    if (g_rpm_display > MAX_MOTOR_RPM)
+    {
+        g_rpm_display = MAX_MOTOR_RPM;
+    }
+    else if (g_rpm_display < 0)
+    {
+        g_rpm_display = 0;
+    }
+}
 
 /*-----------------------------------------------------------*/
 
@@ -57,7 +91,11 @@ static uint8_t           s_hall_prev = 0xFF;  /* force first sample to count */
 static void prvHallSectorChanged(void)
 {
     bool ha, hb, hc;
-    bool count_edge = false;
+
+    if (!s_hall_irq_on)
+    {
+        return;
+    }
 
     IntMasterDisable();
     speed_sensor_read_halls(&ha, &hb, &hc);
@@ -67,11 +105,9 @@ static void prvHallSectorChanged(void)
     {
         g_edges++;
         s_hall_prev = hall;
-        count_edge = true;
     }
     IntMasterEnable();
 
-    (void)count_edge;
     motor_driver_update_commutation();
 }
 
@@ -157,8 +193,73 @@ void HallPortNIntHandler(void)
 /*-----------------------------------------------------------*/
 /* Periodic tick. Called from a 100 Hz software timer or task. */
 
+void speed_sensor_hall_irq_enable(bool enable)
+{
+    if (enable == s_hall_irq_on)
+    {
+        return;
+    }
+
+    IntMasterDisable();
+    if (enable)
+    {
+        GPIOIntClear(HALL_A_PORT, HALL_A_PIN);
+        GPIOIntClear(HALL_B_PORT, HALL_B_PIN);
+        GPIOIntClear(HALL_C_PORT, HALL_C_PIN);
+        GPIOIntEnable(HALL_A_PORT, HALL_A_PIN);
+        GPIOIntEnable(HALL_B_PORT, HALL_B_PIN);
+        GPIOIntEnable(HALL_C_PORT, HALL_C_PIN);
+        s_hall_irq_on = true;
+    }
+    else
+    {
+        GPIOIntDisable(HALL_A_PORT, HALL_A_PIN);
+        GPIOIntDisable(HALL_B_PORT, HALL_B_PIN);
+        GPIOIntDisable(HALL_C_PORT, HALL_C_PIN);
+        g_edges     = 0;
+        s_hall_prev = 0xFF;
+        s_hall_irq_on = false;
+    }
+    IntMasterEnable();
+}
+
+bool speed_sensor_hall_irq_enabled(void)
+{
+    return s_hall_irq_on;
+}
+
 void speed_sensor_tick(uint32_t period_ms)
 {
+    /* Drive off: bleed RPM down; ignore coasting hall bursts (fake 6000+). */
+    if (!s_hall_irq_on)
+    {
+        IntMasterDisable();
+        g_edges = 0;
+        IntMasterEnable();
+        g_rpm_raw = 0;
+        if (g_rpm_filt > 0)
+        {
+            g_rpm_filt -= (g_rpm_filt >> 2) + 1;
+            if (g_rpm_filt < 0)
+            {
+                g_rpm_filt = 0;
+            }
+        }
+        if (g_rpm_display > 0)
+        {
+            g_rpm_display -= (g_rpm_display >> 2) + 1;
+            if (g_rpm_display < 0)
+            {
+                g_rpm_display = 0;
+            }
+        }
+        s_disp_edges_sum = 0;
+        s_disp_integ_cnt = 0;
+        s_ctrl_edges_sum = 0;
+        s_ctrl_integ_cnt = 0;
+        return;
+    }
+
     /* Atomic snapshot-and-clear of the edge counter. */
     uint32_t edges;
     IntMasterDisable();
@@ -171,16 +272,83 @@ void speed_sensor_tick(uint32_t period_ms)
     int32_t rpm_raw = (int32_t)((edges * 60000UL) /
                                 (period_ms * SPEED_EDGES_PER_REV));
 
-    /* Exponential low-pass: y[n] = y[n-1] + alpha*(x - y[n-1]).
-     * alpha = 1/4 gives a ~40 ms time constant at 100 Hz —
-     * smooths quantisation noise on slow rotation without
-     * adding noticeable lag. */
-    if (rpm_raw > MAX_MOTOR_RPM)
+    if (rpm_raw > (int32_t)MOTOR_RATED_MAX_RPM)
     {
-        rpm_raw = MAX_MOTOR_RPM;
+        rpm_raw = (int32_t)MOTOR_RATED_MAX_RPM;
     }
 
-    g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 2);
+    /* Open-loop kickstart creates bogus multi-kRPM hall counts. */
+    if (g_motor_state == MOTOR_STATE_STARTING)
+    {
+        if (rpm_raw > (int32_t)MOTOR_START_HALL_RPM_CAP)
+        {
+            rpm_raw = (int32_t)MOTOR_START_HALL_RPM_CAP;
+        }
+        s_ctrl_edges_sum = 0;
+        s_ctrl_integ_cnt = 0;
+    }
+    else if (g_motor_state == MOTOR_STATE_RUNNING)
+    {
+        /* Average hall edges over 30 ms before the PI filter — stops +/-1-edge
+         * windows from jerking duty every 10 ms. */
+        s_ctrl_edges_sum += edges;
+        s_ctrl_integ_cnt++;
+        if (s_ctrl_integ_cnt >= SPEED_RPM_CTRL_INTEGRATE_TICKS)
+        {
+            uint32_t win_ms = period_ms * SPEED_RPM_CTRL_INTEGRATE_TICKS;
+            rpm_raw = (int32_t)((s_ctrl_edges_sum * 60000UL) /
+                                (win_ms * SPEED_EDGES_PER_REV));
+            if (rpm_raw > (int32_t)MOTOR_RATED_MAX_RPM)
+            {
+                rpm_raw = (int32_t)MOTOR_RATED_MAX_RPM;
+            }
+            s_ctrl_edges_sum = 0;
+            s_ctrl_integ_cnt = 0;
+        }
+        else
+        {
+            /* Hold previous filtered value until the window is full. */
+            rpm_raw = g_rpm_filt;
+        }
+    }
+    else
+    {
+        s_ctrl_edges_sum = 0;
+        s_ctrl_integ_cnt = 0;
+    }
+
+    /* Filter hall RPM — symmetric & slower in Running for smooth PI. */
+    if (g_motor_state == MOTOR_STATE_RUNNING)
+    {
+        int32_t max_delta = 40;
+        int32_t delta = rpm_raw - g_rpm_filt;
+        if (delta > max_delta)
+        {
+            delta = max_delta;
+        }
+        else if (delta < -max_delta)
+        {
+            delta = -max_delta;
+        }
+        g_rpm_filt += delta >> 2;
+    }
+    else if (rpm_raw > g_rpm_filt)
+    {
+        int32_t max_up = g_rpm_filt + 150;
+        if (g_motor_state == MOTOR_STATE_STARTING)
+        {
+            max_up = g_rpm_filt + 40;
+        }
+        if (rpm_raw > max_up)
+        {
+            rpm_raw = max_up;
+        }
+        g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 2);
+    }
+    else
+    {
+        g_rpm_filt = g_rpm_filt + ((rpm_raw - g_rpm_filt) >> 1);
+    }
     if (g_rpm_filt > MAX_MOTOR_RPM)
     {
         g_rpm_filt = MAX_MOTOR_RPM;
@@ -190,7 +358,72 @@ void speed_sensor_tick(uint32_t period_ms)
         g_rpm_filt = 0;
     }
     g_rpm_raw  = rpm_raw;
+
+    /* Display/plot path: integrate edges over 50 ms, then low-pass. */
+    s_disp_edges_sum += edges;
+    s_disp_integ_cnt++;
+    if (s_disp_integ_cnt >= SPEED_RPM_DISPLAY_INTEGRATE_TICKS)
+    {
+        uint32_t win_ms = period_ms * SPEED_RPM_DISPLAY_INTEGRATE_TICKS;
+        int32_t rpm_disp_raw = (int32_t)((s_disp_edges_sum * 60000UL) /
+                                         (win_ms * SPEED_EDGES_PER_REV));
+        if (rpm_disp_raw > (int32_t)MOTOR_RATED_MAX_RPM)
+        {
+            rpm_disp_raw = (int32_t)MOTOR_RATED_MAX_RPM;
+        }
+        if (g_motor_state == MOTOR_STATE_STARTING &&
+            rpm_disp_raw > (int32_t)MOTOR_START_HALL_RPM_CAP)
+        {
+            rpm_disp_raw = (int32_t)MOTOR_START_HALL_RPM_CAP;
+        }
+        prvRpmDisplayUpdate(rpm_disp_raw);
+        s_disp_edges_sum = 0;
+        s_disp_integ_cnt = 0;
+    }
 }
 
-int32_t speed_sensor_get_rpm(void)      { return g_rpm_filt; }
-int32_t speed_sensor_get_rpm_raw(void)  { return g_rpm_raw;  }
+void speed_sensor_reset_filter(void)
+{
+    IntMasterDisable();
+    g_edges    = 0;
+    g_rpm_raw  = 0;
+    g_rpm_filt = 0;
+    g_rpm_display = 0;
+    s_disp_edges_sum = 0;
+    s_disp_integ_cnt = 0;
+    s_ctrl_edges_sum = 0;
+    s_ctrl_integ_cnt = 0;
+    IntMasterEnable();
+}
+
+void speed_sensor_seed_filter(int32_t rpm)
+{
+    if (rpm < 0)
+    {
+        rpm = 0;
+    }
+    if (rpm > MAX_MOTOR_RPM)
+    {
+        rpm = MAX_MOTOR_RPM;
+    }
+    IntMasterDisable();
+    g_rpm_raw     = rpm;
+    g_rpm_filt    = rpm;
+    g_rpm_display = rpm;
+    s_ctrl_edges_sum = 0;
+    s_ctrl_integ_cnt = 0;
+    IntMasterEnable();
+}
+
+int32_t speed_sensor_get_rpm(void)       { return g_rpm_filt; }
+int32_t speed_sensor_get_rpm_raw(void)   { return g_rpm_raw;  }
+
+int32_t speed_sensor_get_rpm_display(void)
+{
+    /* When slowing, follow the fast 10 ms window so the plot drops promptly. */
+    if (g_rpm_raw < g_rpm_filt || g_rpm_raw < g_rpm_display)
+    {
+        return g_rpm_raw;
+    }
+    return g_rpm_display;
+}

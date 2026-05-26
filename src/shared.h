@@ -126,8 +126,12 @@ extern SemaphoreHandle_t  xCommandMutex;
 /* Tunable thresholds (initial values; GUI can override at runtime) */
 
 #define DEFAULT_POWER_LIMIT_W      150.0f
+#define POWER_THRESH_GUI_MIN_W     50.0f
+#define POWER_THRESH_GUI_MAX_W     300.0f
+#define POWER_THRESH_GUI_STEP_W    10.0f
 #define DEFAULT_ACCEL_LIMIT_G      2.0f       /* total |a| in g */
 #define DEFAULT_DISTANCE_LIMIT_MM  200.0f
+#define DEFAULT_COOL_ON_TEMP_C     30.0f
 #define NIGHT_LIGHT_LUX            5.0f
 
 /* Runtime-editable thresholds (GUI Thresholds tab writes; sensor task
@@ -136,14 +140,37 @@ extern SemaphoreHandle_t  xCommandMutex;
 extern volatile float g_thresh_power_w;
 extern volatile float g_thresh_accel_g;
 extern volatile float g_thresh_distance_mm;
-extern volatile float g_thresh_night_lux;     /* day/night cut-off */
-extern volatile float g_thresh_cool_c;        /* cooling-on threshold (deg C) */
+extern volatile float g_thresh_night_lux;
+extern volatile float g_thresh_cool_c;
+
+extern volatile float g_motor_power_watts;
+extern volatile uint16_t g_motor_pwm_duty_pct;
+extern volatile MotorState_t g_motor_state;
 
 extern volatile bool g_motor_estop_armed;
+extern volatile bool g_motor_power_estop_ok;
+
+/*-----------------------------------------------------------*/
+/* Advanced feature: "ACC" (adaptive cruise control) supervisor.
+ *
+ * The speed slider still sets the cruise set-speed (RPM). When ACC is enabled,
+ * motor_task reduces the effective RPM target if the (virtual) following
+ * distance drops below g_thresh_distance_mm.
+ *
+ * Distance is a GUI-controlled "virtual ToF" value so the behavior can be
+ * demonstrated even without a VL53 sensor module installed.
+ */
+extern volatile bool  g_acc_enabled;            /* GUI toggle (Control tab) */
+extern volatile float g_virtual_distance_mm;    /* GUI +/- on Sensors tab */
+
+#define VDIST_GUI_MIN_MM   50.0f
+#define VDIST_GUI_MAX_MM   1000.0f
+#define VDIST_GUI_STEP_MM  50.0f
 
 /* Minimum RPM applied when START is pressed with the slider at 0%. */
-#define MAX_MOTOR_RPM              10000
-#define MIN_START_RPM              500
+#define MOTOR_RATED_MAX_RPM        4000
+#define MAX_MOTOR_RPM              MOTOR_RATED_MAX_RPM
+#define MIN_START_RPM              ((MAX_MOTOR_RPM * 14) / 100)
 
 #ifndef MOTOR_ENABLE_NFAULT_MONITORING
 #define MOTOR_ENABLE_NFAULT_MONITORING  0
@@ -153,9 +180,28 @@ extern volatile bool g_motor_estop_armed;
 #define MOTOR_NFAULT_BLOCKS_START  1
 #endif
 
+#ifndef MOTOR_ENABLE_POWER_SENSOR
+#define MOTOR_ENABLE_POWER_SENSOR  1
+#endif
+
 /* Motor ramp limits (assignment 2.1.3) */
 #define ACCEL_LIMIT_RPMPS          500
 #define DECEL_LIMIT_RPMPS          500
 #define ESTOP_DECEL_LIMIT_RPMPS    1000
+
+#define MOTOR_PI_KP                0.07f
+#define MOTOR_PI_KI                0.012f
+#define MOTOR_PI_DT_S              0.01f
+#define MOTOR_PI_INTEGRAL_MAX      400.0f
+#define MOTOR_MAX_DUTY_PCT         100u
+#define MOTOR_START_DUTY_PCT       18u
+#define MOTOR_START_OL_STEP_TICKS  2u
+#define MOTOR_HALL_RUN_RPM         100
+#define MOTOR_RUN_ENTER_RPM        MOTOR_HALL_RUN_RPM
+#define MOTOR_RUN_DEBOUNCE_TICKS   5
+#define MOTOR_START_HALL_RPM_CAP   700
+#define MOTOR_RUN_MAX_OVERSPEED_RPM 200
+#define MOTOR_DUTY_SLEW_MAX_PCT_PER_TICK  3u
+#define POWER_ESTOP_MIN_RPM        150
 
 #endif /* SHARED_H */

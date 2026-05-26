@@ -26,6 +26,12 @@
 static bool     s_motorlib_ok = false;
 static uint16_t s_duty_percent = 0;
 static bool     s_nfault_gpio_ok = false;
+static bool     s_drive_active = false;
+static bool     s_commutation_enabled = false;
+static uint8_t  s_openloop_idx        = 0;
+
+/* Forward 6-step sequence (H3:H2:H1 = ha:hb:hc). */
+static const uint8_t s_openloop_seq[6] = {5u, 1u, 3u, 2u, 6u, 4u};
 
 /* MotorLib is not re-entrant: hall ISRs call updateMotor() while this task
  * calls setDuty(). Mask interrupts briefly for task-context MotorLib calls. */
@@ -68,6 +74,8 @@ bool motor_driver_hardware_fault_active(void)
 
 bool motor_driver_try_clear_hardware_fault(void)
 {
+    s_commutation_enabled = false;
+    s_drive_active = false;
     prvMotorLibTaskEnter();
     disableMotor();
     prvMotorLibTaskExit();
@@ -88,63 +96,148 @@ void motor_driver_init(void)
     speed_sensor_init();
 }
 
+void motor_driver_openloop_reset(void)
+{
+    s_openloop_idx = 0;
+}
+
+void motor_driver_openloop_step(void)
+{
+    if (!s_drive_active || !s_commutation_enabled)
+    {
+        return;
+    }
+
+    uint8_t hall = s_openloop_seq[s_openloop_idx];
+    bool ha = (hall & 4u) != 0;
+    bool hb = (hall & 2u) != 0;
+    bool hc = (hall & 1u) != 0;
+
+    prvMotorLibTaskEnter();
+    updateMotor(ha, hb, hc);
+    prvMotorLibTaskExit();
+
+    s_openloop_idx = (uint8_t)((s_openloop_idx + 1u) % 6u);
+}
+
 void motor_driver_start(void)
 {
     bool ha, hb, hc;
 
+    motor_driver_openloop_reset();
+    speed_sensor_hall_irq_enable(true);
     prvMotorLibTaskEnter();
-    setDuty(0);
     speed_sensor_read_halls(&ha, &hb, &hc);
     updateMotor(ha, hb, hc);
     enableMotor();
+    s_drive_active = true;
+    s_commutation_enabled = true;
     prvMotorLibTaskExit();
+    motor_driver_set_duty_percent(MOTOR_START_DUTY_PCT);
+}
+
+void motor_driver_disable_drive(void)
+{
+    s_commutation_enabled = false;
+    speed_sensor_hall_irq_enable(false);
+
+    if (!s_drive_active)
+    {
+        return;
+    }
+
+    prvMotorLibTaskEnter();
+    setDuty(0);
+    disableMotor();
+    prvMotorLibTaskExit();
+    s_duty_percent = 0;
+    s_drive_active = false;
 }
 
 void motor_driver_stop(bool brakeHard)
 {
+    s_commutation_enabled = false;
+    speed_sensor_hall_irq_enable(false);
+
+    if (!s_drive_active)
+    {
+        return;
+    }
+
     prvMotorLibTaskEnter();
     setDuty(0);
     stopMotor(brakeHard);
     disableMotor();
     prvMotorLibTaskExit();
+    s_duty_percent = 0;
+    s_drive_active = false;
 }
 
 void motor_driver_estop(void)
 {
-    prvMotorLibTaskEnter();
-    setDuty(0);
-    disableMotor();
-    prvMotorLibTaskExit();
+    motor_driver_disable_drive();
 }
 
-void motor_driver_set_speed_rpm(int32_t rpm)
+uint16_t motor_driver_feedforward_duty_pct(int32_t rpm)
+{
+    if (rpm <= 0)
+    {
+        return 0;
+    }
+    if (rpm > MOTOR_MAX_COMMAND_RPM)
+    {
+        rpm = MOTOR_MAX_COMMAND_RPM;
+    }
+    /* Scale to rated motor RPM so 4000 ref ≈ 100% duty (not 10000). */
+    uint32_t pct = ((uint32_t)rpm * (uint32_t)MOTOR_MAX_DUTY_PCT) /
+                   (uint32_t)MOTOR_RATED_MAX_RPM;
+    if (pct > MOTOR_MAX_DUTY_PCT)
+    {
+        pct = MOTOR_MAX_DUTY_PCT;
+    }
+    return (uint16_t)pct;
+}
+
+void motor_driver_set_duty_percent(uint16_t duty_pct)
 {
     uint16_t period = MOTOR_PWM_PERIOD_US;
     uint32_t us = 0;
 
-    if (rpm > 0)
+    if (duty_pct > MOTOR_MAX_DUTY_PCT)
     {
-        if (rpm > MOTOR_MAX_COMMAND_RPM)
+        duty_pct = MOTOR_MAX_DUTY_PCT;
+    }
+    if (duty_pct > 0)
+    {
+        us = ((uint32_t)duty_pct * (uint32_t)period) / 100u;
+        /* One timer tick (~2% at 50 us period), not 5 us (~10%). A 5 us
+         * floor made low STOP ramp duties jump to ~10% and re-accelerate. */
+        if (us == 0u)
         {
-            rpm = MOTOR_MAX_COMMAND_RPM;
-        }
-        us = ((uint32_t)rpm * (uint32_t)period) / (uint32_t)MOTOR_MAX_COMMAND_RPM;
-        if (us > period)
-        {
-            us = period;
-        }
-        /* Minimum breakdown torque (~10 % PWM) so low slider % still spins. */
-        if (us < 5u)
-        {
-            us = 5u;
+            us = 1u;
         }
     }
 
     prvMotorLibTaskEnter();
     setDuty((uint16_t)us);
     s_duty_percent = (uint16_t)((us * 100u) / period);
-    motor_driver_update_commutation();
+    if (s_commutation_enabled)
+    {
+        bool ha, hb, hc;
+        speed_sensor_read_halls(&ha, &hb, &hc);
+        updateMotor(ha, hb, hc);
+    }
     prvMotorLibTaskExit();
+}
+
+void motor_driver_kickstart(void)
+{
+    motor_driver_set_duty_percent(MOTOR_START_DUTY_PCT);
+}
+
+void motor_driver_set_speed_rpm(int32_t rpm)
+{
+    motor_driver_set_duty_percent(motor_driver_feedforward_duty_pct(rpm));
 }
 
 uint16_t motor_driver_get_duty_percent(void)
@@ -154,6 +247,11 @@ uint16_t motor_driver_get_duty_percent(void)
 
 void motor_driver_update_commutation(void)
 {
+    if (!s_commutation_enabled)
+    {
+        return;
+    }
+
     bool ha, hb, hc;
     speed_sensor_read_halls(&ha, &hb, &hc);
     updateMotor(ha, hb, hc);
@@ -166,7 +264,7 @@ int32_t motor_driver_get_rpm(void)
 
 MotorState_t motor_driver_get_state(void)
 {
-    return MOTOR_STATE_IDLE;
+    return g_motor_state;
 }
 
 bool motor_driver_is_ready(void)

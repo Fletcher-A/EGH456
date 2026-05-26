@@ -46,9 +46,15 @@ QueueHandle_t      xAccelRawQueue = NULL;
 volatile float g_thresh_power_w      = DEFAULT_POWER_LIMIT_W;
 volatile float g_thresh_accel_g      = DEFAULT_ACCEL_LIMIT_G;
 volatile float g_thresh_distance_mm  = DEFAULT_DISTANCE_LIMIT_MM;
-volatile float g_thresh_night_lux    = NIGHT_LIGHT_LUX;   /* GUI-editable */
-volatile float g_thresh_cool_c       = 25.0f;             /* cooling-on cut-off */
+volatile float g_thresh_night_lux    = NIGHT_LIGHT_LUX;
+volatile float g_thresh_cool_c       = 25.0f;
+volatile float g_motor_power_watts   = 0.0f;
+volatile uint16_t g_motor_pwm_duty_pct = 0;
+volatile MotorState_t g_motor_state  = MOTOR_STATE_IDLE;
 volatile bool  g_motor_estop_armed   = false;
+volatile bool  g_motor_power_estop_ok = false;
+volatile bool  g_acc_enabled         = false;
+volatile float g_virtual_distance_mm = 500.0f;
 EventGroupHandle_t xSystemEvents  = NULL;
 SemaphoreHandle_t  xUARTMutex     = NULL;
 SemaphoreHandle_t  xI2CMutex      = NULL;
@@ -87,10 +93,10 @@ int main(void)
         for (;;) {}     /* RTOS object creation failed */
     }
 
-    /* Spawn tasks. */
+    /* Spawn tasks — GUI before sensor so display init is not starved. */
+    vCreateGuiTask();
     vCreateSensorTask();
     vCreateMotorTask();
-    vCreateGuiTask();
     vCreateFaultTask();
 
     IntMasterEnable();

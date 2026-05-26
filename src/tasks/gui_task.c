@@ -76,6 +76,10 @@
 #include "images.h"
 
 #include "shared.h"
+#if MOTOR_ENABLE_POWER_SENSOR
+#include "drivers/power_sensor.h"
+#endif
+#include "drivers/speed_sensor.h"
 #include "utils/uart_log.h"
 /*-----------------------------------------------------------*/
 
@@ -148,11 +152,17 @@ static void OnNightInc (tWidget *psWidget);
 static void OnNightDec (tWidget *psWidget);
 static void OnCoolInc  (tWidget *psWidget);
 static void OnCoolDec  (tWidget *psWidget);
+static void OnAccToggle(tWidget *psWidget);
+static void OnVDistInc(tWidget *psWidget);
+static void OnVDistDec(tWidget *psWidget);
 static void prvRefreshPowerLabel(void);
 static void prvRefreshAccelLabel(void);
 static void prvRefreshNightLabel(void);
 static void prvRefreshCoolLabel(void);
 static void prvRefreshControlThreshLine(void);
+static void prvRefreshVDistLabel(void);
+static void prvRepaintClockDate(void);
+static void prvProcessTouchMessages(void);
 
 extern tCanvasWidget g_psPanels[];
 extern tCanvasWidget g_sPlotCanvas;
@@ -177,15 +187,17 @@ Canvas(g_sStatusIndicator, g_psPanels, &g_sStateText, 0,
        CANVAS_STYLE_FILL | CANVAS_STYLE_OUTLINE,
        ClrOrange, ClrGray, 0, 0, 0, 0, 0);
 
+/* Width stops before the clock column (x=258) — a full-width repaint was
+ * erasing the clock every time RPM updated while the motor was running. */
 Canvas(g_sRpmText, g_psPanels, &g_sStatusIndicator, 0,
        &g_sKentec320x240x16_SSD2119,
-       10, 60, 300, 20,
+       10, 60, 242, 20,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL,
-       ClrBlack, 0, ClrSilver, &g_sFontCm14, "0 / 0 / 0 RPM", 0, 0);
+       ClrBlack, 0, ClrSilver, &g_sFontCm14, "0/0/0 RPM", 0, 0);
 
 Canvas(g_sPowerText, g_psPanels, &g_sRpmText, 0,
        &g_sKentec320x240x16_SSD2119,
-       10, 82, 200, 20,
+       10, 82, 168, 20,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL,
        ClrBlack, 0, ClrSilver, &g_sFontCm18, "0 W", 0, 0);
 
@@ -221,11 +233,11 @@ Canvas(g_sPowerLimitText, g_psPanels, &g_sCoolLed, 0,
        10, 128, 300, 18,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL,
        ClrBlack, 0, ClrGray, &g_sFontCm14,
-       "Power 150W  Accel 2.0g  Dist 200mm", 0, 0);
+       "Pwr/Acc/Nt/Cool thresholds on Thresholds tab", 0, 0);
 
 Canvas(g_sClockText, g_psPanels, &g_sPowerLimitText, 0,
        &g_sKentec320x240x16_SSD2119,
-       220, 60, 90, 20,
+       258, 60, 62, 20,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL | CANVAS_STYLE_TEXT_OPAQUE,
        ClrBlack, 0, ClrWhite, &g_sFontCm18, "00:00:00", 0, 0);
 
@@ -259,11 +271,20 @@ RectangularButton(g_sAckBtn, g_psPanels, &g_sStopBtn, 0,
                   ClrDarkRed, ClrBlack, ClrGray, ClrWhite,
                   &g_sFontCm18, "ACK", 0, 0, 0, 0, OnEStopAckPressed);
 
-/* Date readout: sits right under the clock on the Control tab. */
+/* Date readout: under clock (right column). ACC button is separate — do not
+ * overlap (220,82) or the opaque date canvas hides the button. */
 Canvas(g_sDateText, g_psPanels, &g_sAckBtn, 0, &g_sKentec320x240x16_SSD2119,
-       220, 82, 90, 20,
+       258, 82, 62, 20,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL | CANVAS_STYLE_TEXT_OPAQUE,
        ClrBlack, 0, ClrSilver, &g_sFontCm14, "2026-05-26", 0, 0);
+
+/* ACC toggle: left of clock/date column; last in widget chain = on top for touch. */
+RectangularButton(g_sAccBtn, g_psPanels, &g_sDateText, 0,
+                  &g_sKentec320x240x16_SSD2119,
+                  182, 82, 72, 20,
+                  PB_STYLE_FILL | PB_STYLE_OUTLINE | PB_STYLE_TEXT,
+                  ClrDarkGray, ClrBlack, ClrGray, ClrSilver,
+                  &g_sFontCm14, "ACC OFF", 0, 0, 0, 0, OnAccToggle);
 
 /*-----------------------------------------------------------*/
 /* Panels and tabs. */
@@ -271,7 +292,7 @@ Canvas(g_sDateText, g_psPanels, &g_sAckBtn, 0, &g_sKentec320x240x16_SSD2119,
 tCanvasWidget g_psPanels[] =
 {
     /* Page 0 — Control. */
-    CanvasStruct(0, 0, &g_sDateText, &g_sKentec320x240x16_SSD2119,
+    CanvasStruct(0, 0, &g_sAccBtn, &g_sKentec320x240x16_SSD2119,
                  0, 24, 320, 216, CANVAS_STYLE_FILL,
                  ClrBlack, 0, 0, 0, 0, 0, 0),
 
@@ -315,7 +336,7 @@ Canvas(g_sPlotCanvas, g_psPanels + 1, 0, 0, &g_sKentec320x240x16_SSD2119,
 #define PLOT_WINDOW_S 5.0f        /* 25 samples x 200 ms sample period */
 #define PLOT_SAMPLES  25
 #define PLOT_RPM_MAX    ((float)MAX_MOTOR_RPM)
-#define PLOT_POWER_MAX   200.0f
+#define PLOT_POWER_MAX   350.0f
 #define PLOT_LUX_MAX     500.0f
 #define PLOT_ACCEL_MAX     2.0f       /* +-2 g full scale, centred on plot */
 #define PLOT_TEMP_MIN     10.0f       /* deg C baseline (subtracted before plotting) */
@@ -521,11 +542,11 @@ static void OnPlotCanvasPaint(tWidget *psWidget, tContext *psContext)
     const int xPres  = PLOT_X + 232;
 
     GrContextForegroundSet(psContext, ClrGoldenrod);
-    GrStringDraw(psContext, "10000",    -1, xRPM,  yTop, 1);
+    GrStringDraw(psContext, "4000",     -1, xRPM,  yTop, 1);
     GrStringDraw(psContext, "0",        -1, xRPM,  yBot, 1);
 
     GrContextForegroundSet(psContext, ClrCyan);
-    GrStringDraw(psContext, "200W",     -1, xPow,  yTop, 1);
+    GrStringDraw(psContext, "350W",     -1, xPow,  yTop, 1);
     GrStringDraw(psContext, "0W",       -1, xPow,  yBot, 1);
 
     GrContextForegroundSet(psContext, ClrWhite);
@@ -635,10 +656,31 @@ Canvas(g_sSensPowText, g_psPanels + 2, &g_sSensRpmText, 0,
        CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL | CANVAS_STYLE_TEXT_LEFT,
        ClrBlack, 0, ClrCyan, &g_sFontCm18, "Power: --- W", 0, 0);
 
+/* Row 7 - Virtual distance (ACC demo input). */
+Canvas(g_sSensDistText, g_psPanels + 2, &g_sSensPowText, 0,
+       &g_sKentec320x240x16_SSD2119,
+       SROW_TX, SROW_Y0 + 7*SROW_DY, SROW_TW, 22,
+       CANVAS_STYLE_TEXT | CANVAS_STYLE_FILL | CANVAS_STYLE_TEXT_LEFT,
+       ClrBlack, 0, ClrWhite, &g_sFontCm18, "Dist:  --- mm", 0, 0);
+
+RectangularButton(g_sVDistDecBtn, g_psPanels + 2, &g_sSensDistText, 0,
+                  &g_sKentec320x240x16_SSD2119,
+                  248, SROW_Y0 + 7*SROW_DY, 30, 22,
+                  PB_STYLE_FILL | PB_STYLE_OUTLINE | PB_STYLE_TEXT,
+                  ClrGray, ClrBlack, ClrGray, ClrBlack,
+                  &g_sFontCm16, "-", 0, 0, 0, 0, OnVDistDec);
+
+RectangularButton(g_sVDistIncBtn, g_psPanels + 2, &g_sVDistDecBtn, 0,
+                  &g_sKentec320x240x16_SSD2119,
+                  280, SROW_Y0 + 7*SROW_DY, 30, 22,
+                  PB_STYLE_FILL | PB_STYLE_OUTLINE | PB_STYLE_TEXT,
+                  ClrGray, ClrBlack, ClrGray, ClrBlack,
+                  &g_sFontCm16, "+", 0, 0, 0, 0, OnVDistInc);
+
 /* Seven plot-toggle buttons. Each toggles g_trace_enabled[t] for its
  * trace; the button's fill colour and text track the state (trace
  * colour + "ON" when enabled, dark grey + "OFF" when disabled). */
-RectangularButton(g_sBtnTogLux, g_psPanels + 2, &g_sSensPowText, 0,
+RectangularButton(g_sBtnTogLux, g_psPanels + 2, &g_sVDistIncBtn, 0,
                   &g_sKentec320x240x16_SSD2119,
                   SROW_BX, SROW_Y0 + 0*SROW_DY, SROW_BW, SROW_BH,
                   PB_STYLE_FILL | PB_STYLE_OUTLINE | PB_STYLE_TEXT,
@@ -693,9 +735,11 @@ RectangularButton(g_sBtnTogPow, g_psPanels + 2, &g_sBtnTogRpm, 0,
 /* Page 3 — Thresholds tab.
  *
  * Three rows, each "label + value + [-] + [+]":
- *   Power     150 W       step  10 W       range  50 .. 300
+ *   Power     300 W       step  10 W       range  50 .. 300
  *   Accel     2.0 g       step 0.1 g       range 0.5 .. 4.0
- *   Distance  200 mm      step  50 mm      range  50 .. 1000
+ *   Night     5 lux       step  1 lux      range  1 .. 50
+ *   Cool      25 C        step  1 C        range 10 .. 40
+ *   (Distance/ToF not used — optional sensor: BMI160 + SHT31)
  *
  * The +/- callbacks mutate the runtime threshold globals and refresh
  * the value-text widgets in place. Sensor task picks up the new
@@ -958,6 +1002,7 @@ static void OnStartPressed(tWidget *psWidget)
         WidgetPaint((tWidget *)&g_sSpeedSlider);
     }
     prvSendLatestRpmCommand(rpm);
+    speed_sensor_reset_filter();
     xEventGroupClearBits(xSystemEvents, EVT_USER_STOP);
     xEventGroupSetBits(xSystemEvents, EVT_USER_START);
 #if MOTOR_ENABLE_NFAULT_MONITORING
@@ -977,6 +1022,7 @@ static void OnStopPressed(tWidget *psWidget)
     SliderValueSet(&g_sSpeedSlider, 0);
     prvRefreshSpeedSliderLabel(0);
     WidgetPaint((tWidget *)&g_sSpeedSlider);
+    xEventGroupClearBits(xSystemEvents, EVT_USER_START);
     xEventGroupSetBits(xSystemEvents, EVT_USER_STOP);
 }
 
@@ -1055,6 +1101,26 @@ static void prvRefreshControlThreshLine(void)
      * would land on whatever panel is currently mounted. */
     if (g_ui32Panel == 0)
         WidgetPaint((tWidget *)&g_sPowerLimitText);
+}
+
+/* Clock/date sit above the RPM line; partial RPM repaint can erase them. */
+static void prvRepaintClockDate(void)
+{
+    if (g_ui32Panel != 0)
+    {
+        return;
+    }
+    WidgetPaint((tWidget *)&g_sClockText);
+    WidgetPaint((tWidget *)&g_sDateText);
+}
+
+/* Drain touch/paint messages — call often so the LCD stays responsive. */
+static void prvProcessTouchMessages(void)
+{
+    for (uint8_t n = 0; n < 4u; n++)
+    {
+        WidgetMessageQueueProcess();
+    }
 }
 
 /* Control-tab status line under thresholds (fault text, duty debug, etc.). */
@@ -1136,15 +1202,21 @@ static void prvRefreshControlStatusLine(void)
 }
 
 static void OnPowerInc(tWidget *w) { (void)w;
-    g_thresh_power_w += 10.0f;
-    if (g_thresh_power_w > 300.0f) g_thresh_power_w = 300.0f;
+    g_thresh_power_w += POWER_THRESH_GUI_STEP_W;
+    if (g_thresh_power_w > POWER_THRESH_GUI_MAX_W)
+    {
+        g_thresh_power_w = POWER_THRESH_GUI_MAX_W;
+    }
     prvRefreshPowerLabel();
     xEventGroupSetBits(xSystemEvents, EVT_USER_THRESHOLD_CHANGED);
     prvRefreshControlThreshLine();
 }
 static void OnPowerDec(tWidget *w) { (void)w;
-    g_thresh_power_w -= 10.0f;
-    if (g_thresh_power_w < 50.0f) g_thresh_power_w = 50.0f;
+    g_thresh_power_w -= POWER_THRESH_GUI_STEP_W;
+    if (g_thresh_power_w < POWER_THRESH_GUI_MIN_W)
+    {
+        g_thresh_power_w = POWER_THRESH_GUI_MIN_W;
+    }
     prvRefreshPowerLabel();
     xEventGroupSetBits(xSystemEvents, EVT_USER_THRESHOLD_CHANGED);
     prvRefreshControlThreshLine();
@@ -1190,6 +1262,54 @@ static void OnCoolDec(tWidget *w) { (void)w;
     prvRefreshCoolLabel();
     xEventGroupSetBits(xSystemEvents, EVT_USER_THRESHOLD_CHANGED);
     prvRefreshControlThreshLine();
+}
+
+/*-----------------------------------------------------------*/
+/* Advanced feature: ACC (virtual distance) UI. */
+
+static void prvAccPaint(void)
+{
+    bool on = g_acc_enabled;
+    g_sAccBtn.ui32FillColor = on ? ClrLimeGreen : ClrDarkGray;
+    g_sAccBtn.ui32TextColor = on ? ClrBlack     : ClrSilver;
+    PushButtonTextSet(&g_sAccBtn, (char *)(on ? "ACC ON" : "ACC OFF"));
+    WidgetPaint((tWidget *)&g_sAccBtn);
+}
+
+static void prvRefreshVDistLabel(void)
+{
+    static char s_dist[32];
+    int d = (int)(g_virtual_distance_mm + 0.5f);
+    int min = (int)(g_thresh_distance_mm + 0.5f);
+    usprintf(s_dist, "Dist:  %d mm  (min %d)", d, min);
+    CanvasTextSet(&g_sSensDistText, s_dist);
+    if (g_ui32Panel == 2)
+    {
+        WidgetPaint((tWidget *)&g_sSensDistText);
+    }
+}
+
+static void OnAccToggle(tWidget *w)
+{
+    (void)w;
+    g_acc_enabled = !g_acc_enabled;
+    prvAccPaint();
+}
+
+static void OnVDistInc(tWidget *w)
+{
+    (void)w;
+    g_virtual_distance_mm += VDIST_GUI_STEP_MM;
+    if (g_virtual_distance_mm > VDIST_GUI_MAX_MM) g_virtual_distance_mm = VDIST_GUI_MAX_MM;
+    prvRefreshVDistLabel();
+}
+
+static void OnVDistDec(tWidget *w)
+{
+    (void)w;
+    g_virtual_distance_mm -= VDIST_GUI_STEP_MM;
+    if (g_virtual_distance_mm < VDIST_GUI_MIN_MM) g_virtual_distance_mm = VDIST_GUI_MIN_MM;
+    prvRefreshVDistLabel();
 }
 
 /*-----------------------------------------------------------*/
@@ -1292,6 +1412,7 @@ static void prvRedrawWidgets(void)
         static char s_rpm_buf[24];
         static char s_power_buf[24];
         static char s_clock_buf[24];
+        static bool last_acc_on = (bool)-1;
 
         if (g_state != last_state)
         {
@@ -1334,25 +1455,57 @@ static void prvRedrawWidgets(void)
                  g_state == MOTOR_STATE_RUNNING ||
                  g_state == MOTOR_STATE_STOPPING)
         {
-            static uint16_t last_pwm = 0xFFFFu;
-            if (g_pwm_duty != last_pwm)
+            /* Duty/Hall debug line used to repaint on every PI tick (~100 Hz)
+             * and blocked touch for tens of ms per frame. Throttle heavily. */
+            static uint16_t    last_pwm_stat = 0xFFFFu;
+            static TickType_t last_stat_paint = 0;
+            TickType_t now_stat = xTaskGetTickCount();
+            int pwm_diff = (int)g_pwm_duty - (int)last_pwm_stat;
+            if (pwm_diff < 0)
+            {
+                pwm_diff = -pwm_diff;
+            }
+            bool stat_due = (now_stat - last_stat_paint >= pdMS_TO_TICKS(500));
+            if (last_pwm_stat == 0xFFFFu || pwm_diff >= 5 || stat_due)
             {
                 prvRefreshControlStatusLine();
-                last_pwm = g_pwm_duty;
+                last_pwm_stat = g_pwm_duty;
+                last_stat_paint = now_stat;
             }
         }
 
         if (g_rpm_actual != last_rpm || g_rpm_reference != last_rpm_ref ||
             g_rpm_desired != last_rpm_des)
         {
-            /* Hall / ramp / slider target (RPM). */
-            usprintf(s_rpm_buf, "%d / %d / %d RPM",
-                     (int)g_rpm_actual, (int)g_rpm_reference, (int)g_rpm_desired);
-            CanvasTextSet(&g_sRpmText, s_rpm_buf);
-            WidgetPaint((tWidget *)&g_sRpmText);
+            int32_t d_act = g_rpm_actual - last_rpm;
+            int32_t d_ref = g_rpm_reference - last_rpm_ref;
+            int32_t d_des = g_rpm_desired - last_rpm_des;
+            if (d_act < 0) d_act = -d_act;
+            if (d_ref < 0) d_ref = -d_ref;
+            if (d_des < 0) d_des = -d_des;
+
+            /* Throttle repaint while running — hall display still updates
+             * in the model but we only redraw when change is visible. */
+            static TickType_t last_rpm_paint = 0;
+            TickType_t now_rpm = xTaskGetTickCount();
+            bool big_change = (d_act >= 20 || d_ref >= 20 || d_des >= 20);
+            bool paint_rpm = (last_rpm < 0) || big_change ||
+                             (now_rpm - last_rpm_paint >= pdMS_TO_TICKS(250));
+
             last_rpm     = g_rpm_actual;
             last_rpm_ref = g_rpm_reference;
             last_rpm_des = g_rpm_desired;
+
+            if (paint_rpm)
+            {
+                usprintf(s_rpm_buf, "%d/%d/%d RPM",
+                         (int)g_rpm_actual, (int)g_rpm_reference,
+                         (int)g_rpm_desired);
+                CanvasTextSet(&g_sRpmText, s_rpm_buf);
+                WidgetPaint((tWidget *)&g_sRpmText);
+                prvRepaintClockDate();
+                last_rpm_paint = now_rpm;
+            }
         }
 
         int p = (int)(g_power_w + 0.5f);
@@ -1363,6 +1516,12 @@ static void prvRedrawWidgets(void)
             CanvasTextSet(&g_sPowerText, s_power_buf);
             WidgetPaint((tWidget *)&g_sPowerText);
             last_pwr_int = p;
+        }
+
+        if (g_acc_enabled != last_acc_on)
+        {
+            prvAccPaint();
+            last_acc_on = g_acc_enabled;
         }
 
         /* Simple threshold (no hysteresis): below the user-set night
@@ -1398,7 +1557,6 @@ static void prvRedrawWidgets(void)
             uint32_t s =  sec % 60;
             usprintf(s_clock_buf, "%02d:%02d:%02d", h, m, s);
             CanvasTextSet(&g_sClockText, s_clock_buf);
-            WidgetPaint((tWidget *)&g_sClockText);
 
             /* Date: walk forward from the demo epoch by elapsed days.
              * Cheap O(days) loop; demo never runs long enough to feel it. */
@@ -1425,10 +1583,10 @@ static void prvRedrawWidgets(void)
             {
                 usprintf(s_date_buf, "%04d-%02d-%02d", y, mo, d);
                 CanvasTextSet(&g_sDateText, s_date_buf);
-                WidgetPaint((tWidget *)&g_sDateText);
                 last_day = d;
             }
 
+            prvRepaintClockDate();
             last_sec = sec;
         }
     }
@@ -1439,6 +1597,7 @@ static void prvRedrawWidgets(void)
          * stores the pointer, not the string. */
         static char s_lux[24], s_ax[16], s_ay[16], s_az[16];
         static char s_temp[24], s_hum[24], s_pres[24];
+        static int  last_vdist_i = -1;
 
         int lux_i = (int)(g_light_lux + 0.5f);
         if (lux_i != last_lux_int)
@@ -1536,6 +1695,13 @@ static void prvRedrawWidgets(void)
             last_sens_pow_i = p_i;
         }
 
+        int vdist_i = (int)(g_virtual_distance_mm + 0.5f);
+        if (vdist_i != last_vdist_i)
+        {
+            prvRefreshVDistLabel();
+            last_vdist_i = vdist_i;
+        }
+
     }
 }
 
@@ -1559,10 +1725,13 @@ static void prvGuiTask(void *pvParameters)
     uDMAControlBaseSet(&s_DMAControlTable[0]);
     uDMAEnable();
 
+    uart_log_printf("GUI: LCD init...\n");
+
     /* LCD + grlib + touch. */
     Kentec320x240x16_SSD2119Init(g_ui32SysClock);
     GrContextInit(&sContext, &g_sKentec320x240x16_SSD2119);
     TouchScreenInit(g_ui32SysClock);
+    uart_log_printf("GUI: LCD + touch ready\n");
     TouchScreenCallbackSet(WidgetPointerMessage);
 
     /* Initial widget tree. */
@@ -1577,8 +1746,8 @@ static void prvGuiTask(void *pvParameters)
 
     for (;;)
     {
-        /* 1. Process widget message queue (touches + paints). */
-        WidgetMessageQueueProcess();
+        /* 1. Touch first — do not let SPI readouts starve the queue. */
+        prvProcessTouchMessages();
 
         /* 2. Handle a deferred tab switch. */
         if (g_pendingPanel >= 0)
@@ -1601,10 +1770,6 @@ static void prvGuiTask(void *pvParameters)
             g_fault_bits = motor_msg.fault_bits;
             g_hall_state = motor_msg.hall_state;
             g_motor_ready = motor_msg.motor_ready;
-            /* Motor task supplies simulated power until the DRV8323
-             * is wired up and the sensor-task ADC pipeline goes live;
-             * switch this back to sensor_msg.power_watts then. */
-            g_power_w    = motor_msg.power_watts;
         }
         while (xQueueReceive(xSensorQueue, &sensor_msg, 0) == pdPASS)
         {
@@ -1620,6 +1785,13 @@ static void prvGuiTask(void *pvParameters)
             g_sht_ok       = sensor_msg.sht_ok;
         }
 
+        /* Power comes only from the ADC pipeline (sensor task), not motor queue. */
+#if MOTOR_ENABLE_POWER_SENSOR
+        g_power_w = power_sensor_zero_ready() ? g_motor_power_watts : 0.0f;
+#else
+        g_power_w = g_motor_power_watts;
+#endif
+
         /* 4. Refresh whichever readout tab is currently showing. */
         prvRedrawWidgets();
 
@@ -1629,19 +1801,22 @@ static void prvGuiTask(void *pvParameters)
         if (now - last_sample_tick >= pdMS_TO_TICKS(200))
         {
             last_sample_tick = now;
-            prvPlotPush((float)g_rpm_actual, g_power_w, g_light_lux, g_accel_g,
+            /* Plot reference (500 RPM/s ramp) — actual hall speed is noisier. */
+            prvPlotPush((float)g_rpm_reference, g_power_w, g_light_lux, g_accel_g,
                         g_temp_c, g_humidity_pct, g_pressure_hpa);
         }
 
-        /* 6. Repaint the plot at ~5 Hz only while the Plots tab is up. */
-        if (g_ui32Panel == 1 && (now - last_plot_paint >= pdMS_TO_TICKS(200)))
+        /* 6. Repaint the plot at ~2 Hz on Plots tab (full canvas is costly). */
+        if (g_ui32Panel == 1 && (now - last_plot_paint >= pdMS_TO_TICKS(500)))
         {
             last_plot_paint = now;
             WidgetPaint((tWidget *)&g_sPlotCanvas);
         }
 
-        /* Small task delay so we don't peg the CPU. */
-        vTaskDelay(pdMS_TO_TICKS(20));
+        prvProcessTouchMessages();
+
+        /* 5 ms loop -> touch polled ~200 Hz; was 20 ms (~50 Hz). */
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -1649,7 +1824,9 @@ static void prvGuiTask(void *pvParameters)
 
 void vCreateGuiTask(void)
 {
+    /* Above sensor (+3) during boot so Kentec/touch init is not starved by
+     * I2C sensor bring-up or the 1 kHz power ADC ISR load. */
     xTaskCreate(prvGuiTask, "GUI",
                 configMINIMAL_STACK_SIZE * 8, NULL,
-                tskIDLE_PRIORITY + 2, NULL);
+                tskIDLE_PRIORITY + 5, NULL);
 }

@@ -27,12 +27,19 @@
 #include <stdbool.h>
 
 #define SPEED_EDGES_PER_REV     24      /* 6 * pole_pairs */
+#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  5
+#define SPEED_RPM_CTRL_INTEGRATE_TICKS     3
 
 void    speed_sensor_init(void);
 void    speed_sensor_read_halls(bool *ha, bool *hb, bool *hc);
-int32_t speed_sensor_get_rpm(void);          /* latest filtered RPM */
-int32_t speed_sensor_get_rpm_raw(void);      /* most recent un-filtered RPM */
+int32_t speed_sensor_get_rpm(void);
+int32_t speed_sensor_get_rpm_raw(void);
+int32_t speed_sensor_get_rpm_display(void);
 void    speed_sensor_tick(uint32_t period_ms);
+void    speed_sensor_reset_filter(void);
+void    speed_sensor_seed_filter(int32_t rpm);
+void    speed_sensor_hall_irq_enable(bool enable);
+bool    speed_sensor_hall_irq_enabled(void);
 
 /* Three port ISRs (wired in startup_gcc.c). Each one just increments
  * the shared edge counter — extremely short, no FreeRTOS calls. */

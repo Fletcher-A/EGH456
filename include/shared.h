@@ -143,8 +143,12 @@ extern SemaphoreHandle_t  xCommandMutex; /* serialises xCommandQueue access */
 /* Tunable thresholds (initial values; GUI can override at runtime) */
 
 #define DEFAULT_POWER_LIMIT_W      150.0f
+#define POWER_THRESH_GUI_MIN_W     50.0f
+#define POWER_THRESH_GUI_MAX_W     300.0f
+#define POWER_THRESH_GUI_STEP_W    10.0f
 #define DEFAULT_ACCEL_LIMIT_G      2.0f       /* total |a| in g */
 #define DEFAULT_DISTANCE_LIMIT_MM  200.0f
+#define DEFAULT_COOL_ON_TEMP_C     30.0f   /* SHT31: Cooling On above this (spec 2.3.2) */
 #define NIGHT_LIGHT_LUX            5.0f
 
 /* Runtime-editable thresholds (GUI Thresholds tab writes; sensor task
@@ -156,14 +160,42 @@ extern volatile float g_thresh_distance_mm;
 extern volatile float g_thresh_night_lux;     /* day/night cut-off */
 extern volatile float g_thresh_cool_c;        /* cooling-on threshold (deg C) */
 
+/* Filtered motor power (W) from sensor task ADC pipeline. */
+extern volatile float g_motor_power_watts;
+extern volatile uint16_t g_motor_pwm_duty_pct;
+/* Current motor state for motor_driver_get_state() / other readers. */
+extern volatile MotorState_t g_motor_state;
+
 /* True while motor may run (Starting/Running). Sensor task only asserts
  * EVT_ESTOP_* when this is set so bench vibration cannot latch a fault
  * while Idle. Cleared on STOP/ACK. */
 extern volatile bool g_motor_estop_armed;
+/* False during soft-start; sensor power E-stop waits for this. */
+extern volatile bool g_motor_power_estop_ok;
 
-/* Commanded speed range (GUI slider, motor task, open-loop duty map). */
-#define MAX_MOTOR_RPM              10000
-#define MIN_START_RPM              500
+/*-----------------------------------------------------------*/
+/* Advanced feature: "ACC" (adaptive cruise control) supervisor.
+ *
+ * Slider command remains the cruise set-speed (RPM). When ACC is enabled,
+ * motor_task reduces the effective RPM target if the (virtual) following
+ * distance drops below g_thresh_distance_mm.
+ *
+ * Distance is a GUI-controlled "virtual ToF" value so the behavior can be
+ * demonstrated even without a VL53 sensor module installed.
+ */
+extern volatile bool  g_acc_enabled;            /* GUI toggle (Control tab) */
+extern volatile float g_virtual_distance_mm;    /* GUI +/- on Sensors tab */
+
+#define VDIST_GUI_MIN_MM   50.0f
+#define VDIST_GUI_MAX_MM   1000.0f
+#define VDIST_GUI_STEP_MM  50.0f
+
+/* Bench motor mechanical rating (BLY172S-24V-4000). */
+#define MOTOR_RATED_MAX_RPM        4000
+/* Slider and RPM commands: 0 .. rated max (achievable speed on this motor). */
+#define MAX_MOTOR_RPM              MOTOR_RATED_MAX_RPM
+/* Minimum speed after START (14% of slider max). */
+#define MIN_START_RPM              ((MAX_MOTOR_RPM * 14) / 100)
 
 /* Poll DRV8323 nFAULT on PL0 (active low). Set to 1 only after the motor-board
  * red LED / nFAULT line is confirmed on your adapter — see motorlib_example
@@ -177,9 +209,39 @@ extern volatile bool g_motor_estop_armed;
 #define MOTOR_NFAULT_BLOCKS_START  1
 #endif
 
+/* Set to 1 when DRV8323 phase-current ADC (PE0/PE1) is wired. Leave 0 on
+ * bench setups — init can interfere and floating ADC triggers false E-stop. */
+#ifndef MOTOR_ENABLE_POWER_SENSOR
+#define MOTOR_ENABLE_POWER_SENSOR  1
+#endif
+
 /* Motor ramp limits (assignment 2.1.3) */
 #define ACCEL_LIMIT_RPMPS          500
 #define DECEL_LIMIT_RPMPS          500
 #define ESTOP_DECEL_LIMIT_RPMPS    1000
+
+/* PI speed loop (assignment 2.1.2): duty% = FF(rpm_ref) + Kp*e + Ki*integral. */
+#define MOTOR_PI_KP                0.07f
+#define MOTOR_PI_KI                0.012f
+#define MOTOR_PI_DT_S              0.01f
+#define MOTOR_PI_INTEGRAL_MAX      400.0f
+#define MOTOR_MAX_DUTY_PCT         100u
+#define MOTOR_START_DUTY_PCT       18u   /* open-loop kickstart duty (%) */
+#define MOTOR_START_OL_STEP_TICKS  2u    /* advance commutation every N motor ticks */
+#define MOTOR_HALL_RUN_RPM         100   /* valid hall speed -> leave open-loop kickstart */
+#define MOTOR_RUN_ENTER_RPM        MOTOR_HALL_RUN_RPM
+#define MOTOR_RUN_DEBOUNCE_TICKS   5     /* 5 x 10 ms; reject one-shot hall spikes */
+/* Reject open-loop hall bursts before closed-loop (slider can be 560, halls read 4000). */
+#define MOTOR_START_HALL_RPM_CAP   700
+#define MOTOR_RUN_MAX_OVERSPEED_RPM 200
+/* Max duty change per 10 ms tick (Starting->Running handoff + PI). */
+#define MOTOR_DUTY_SLEW_MAX_PCT_PER_TICK  3u
+/* Distance E-stop (VL53L0X): not used — team sensors are BMI160 + SHT31. */
+#ifndef MOTOR_ENABLE_DISTANCE_ESTOP
+#define MOTOR_ENABLE_DISTANCE_ESTOP  0
+#endif
+
+/* Ignore power E-stop below this RPM (floating ADC when motor is idle). */
+#define POWER_ESTOP_MIN_RPM        150
 
 #endif /* SHARED_H */

@@ -27,24 +27,62 @@
 #include "task.h"
 #include "event_groups.h"
 #include "shared.h"
+#include "utils/uart_log.h"
 /*-----------------------------------------------------------*/
+
+static void prvLogFaultBits(EventBits_t bits)
+{
+    if (bits & EVT_ESTOP_POWER)
+    {
+        uart_log_printf("FAULT: power E-stop (limit %.0f W, measured %.0f W)\n",
+                        g_thresh_power_w, g_motor_power_watts);
+    }
+    if (bits & EVT_ESTOP_ACCEL)
+    {
+        uart_log_printf("FAULT: accel E-stop (limit %.1f g)\n",
+                        g_thresh_accel_g);
+    }
+    if (bits & EVT_ESTOP_DISTANCE)
+    {
+        uart_log_printf("FAULT: distance E-stop\n");
+    }
+    if (bits & EVT_ESTOP_DRIVER)
+    {
+        uart_log_printf("FAULT: DRV8323 nFAULT (driver hardware)\n");
+    }
+    if (bits & EVT_SENSOR_FAULT)
+    {
+        uart_log_printf("FAULT: sensor / MotorLib init error\n");
+    }
+}
 
 static void prvFaultTask(void *pvParameters)
 {
     (void)pvParameters;
+    EventBits_t last_logged = 0;
+
+    uart_log_printf("Fault task ready (waits on EVT_ESTOP_* / EVT_SENSOR_FAULT)\n");
 
     for (;;)
     {
-        /* Block until any fault bit fires. We don't clear them here —
-         * motor_task consumes EVT_ESTOP_* in its state machine. */
-        xEventGroupWaitBits(xSystemEvents,
-                            EVT_ESTOP_ANY | EVT_SENSOR_FAULT,
-                            pdFALSE, pdFALSE,
-                            portMAX_DELAY);
+        EventBits_t bits = xEventGroupWaitBits(
+            xSystemEvents,
+            EVT_ESTOP_ANY | EVT_SENSOR_FAULT,
+            pdFALSE, pdFALSE,
+            portMAX_DELAY);
 
-        /* TODO: log over UART once UART is configured. */
+        EventBits_t newly = bits & ~last_logged;
+        if (newly != 0)
+        {
+            prvLogFaultBits(newly);
+            last_logged |= newly;
+        }
 
-        /* Cool-down so we don't loop tightly while a bit stays set. */
+        if ((bits & (EVT_ESTOP_ANY | EVT_SENSOR_FAULT)) == 0)
+        {
+            last_logged = 0;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }

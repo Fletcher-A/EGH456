@@ -27,11 +27,23 @@
 
 #define SPEED_EDGES_PER_REV     24      /* 6 * pole_pairs */
 
+/* GUI/plot: integrate hall edges over this many 10 ms ticks (50 ms) so
+ * +/-1 edge quantization does not show as +/-200 RPM jitter on the plot. */
+#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  5
+/* PI feedback: shorter window than display — smooth without lagging the ramp. */
+#define SPEED_RPM_CTRL_INTEGRATE_TICKS     3
+
 void    speed_sensor_init(void);
 void    speed_sensor_read_halls(bool *ha, bool *hb, bool *hc);
-int32_t speed_sensor_get_rpm(void);          /* latest filtered RPM */
-int32_t speed_sensor_get_rpm_raw(void);      /* most recent un-filtered RPM */
+int32_t speed_sensor_get_rpm(void);          /* filtered RPM (PI / control) */
+int32_t speed_sensor_get_rpm_raw(void);      /* most recent 10 ms window RPM */
+int32_t speed_sensor_get_rpm_display(void);  /* fast drop for GUI + plot */
 void    speed_sensor_tick(uint32_t period_ms);
+void    speed_sensor_reset_filter(void);
+void    speed_sensor_seed_filter(int32_t rpm);
+/* Disable hall GPIO ISRs (STOP coast) — stops updateMotor() and edge bursts. */
+void    speed_sensor_hall_irq_enable(bool enable);
+bool    speed_sensor_hall_irq_enabled(void);
 
 /* Three port ISRs (wired in startup_gcc.c). Each one just increments
  * the shared edge counter — extremely short, no FreeRTOS calls. */

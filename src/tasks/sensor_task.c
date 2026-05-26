@@ -18,7 +18,7 @@
  *   xSystemEvents bits set/cleared by this task:
  *       EVT_NIGHT_DETECTED  set when filtered lux < NIGHT_LIGHT_LUX
  *                           cleared otherwise. Read by gui_task.c.
- *       EVT_ESTOP_ACCEL     set when filtered total |a| exceeds limit.
+ *       EVT_ESTOP_ACCEL     set when peak |ax|+|ay|+|az| exceeds limit (latched).
  *                           Read by motor_task.c (E-Stop braking).
  *
  * PUBLIC FUNCTIONS:
@@ -67,6 +67,7 @@ extern uint32_t g_ui32SysClock;
 #define LUX_READ_EVERY_N     10      /* read OPT3001 every 200 ms (5 Hz)   */
 #define BME_READ_EVERY_N     50      /* read BME280  every 1 s   (1 Hz)   */
 #define MAF_WINDOW           8
+#define ACCEL_MAF_WINDOW     8       /* spec 2.2.2: filtered |a| for GUI/report */
 
 #define ACCEL_SAMPLE_HZ     200      /* spec: >= 100 Hz */
 
@@ -89,9 +90,21 @@ static bool     g_bLuxFull  = false;
  * window, fast enough to catch an overcurrent and slow enough to
  * reject PWM switching noise. Buffer holds total motor current (A). */
 #define POW_MAF_WINDOW   32
+#define POWER_ESTOP_DEBOUNCE_TICKS  15u  /* 15 x 20 ms: ignore inrush transients */
 static float    g_fPowBuf[POW_MAF_WINDOW] = {0};
 static uint8_t  g_ui8PowIdx = 0;
 static bool     g_bPowFull  = false;
+static uint8_t  s_pwr_estop_cnt = 0;
+
+static void prvPowMAFReset(void)
+{
+    for (uint8_t i = 0; i < POW_MAF_WINDOW; i++)
+    {
+        g_fPowBuf[i] = 0.0f;
+    }
+    g_ui8PowIdx = 0;
+    g_bPowFull  = false;
+}
 
 static float prvPowMAFUpdate(float newVal)
 {
@@ -101,6 +114,27 @@ static float prvPowMAFUpdate(float newVal)
     uint8_t count = g_bPowFull ? POW_MAF_WINDOW : g_ui8PowIdx;
     float sum = 0.0f;
     for (uint8_t i = 0; i < count; i++) sum += g_fPowBuf[i];
+    return sum / count;
+}
+
+static float    g_fAccelBuf[ACCEL_MAF_WINDOW] = {0};
+static uint8_t  g_ui8AccelIdx = 0;
+static bool     g_bAccelFull  = false;
+
+static float prvAccelMAFUpdate(float newVal)
+{
+    g_fAccelBuf[g_ui8AccelIdx] = newVal;
+    g_ui8AccelIdx = (g_ui8AccelIdx + 1) % ACCEL_MAF_WINDOW;
+    if (g_ui8AccelIdx == 0)
+    {
+        g_bAccelFull = true;
+    }
+    uint8_t count = g_bAccelFull ? ACCEL_MAF_WINDOW : g_ui8AccelIdx;
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < count; i++)
+    {
+        sum += g_fAccelBuf[i];
+    }
     return sum / count;
 }
 
@@ -209,14 +243,20 @@ static void prvSensorTask(void *pvParameters)
     sensorOpt3001Init();
     xSemaphoreGive(xI2CMutex);
 
-    /* DRV8323 ADC current sensing — Timer0A triggers ADC1 SS0 at
-     * 1 kHz; the ISR queues raw counts; we drain + filter here.
-     * DISABLED until the motor BoosterPack is wired — the power
-     * pipeline (ISR, queue, MAF, EVT_ESTOP_POWER) is implemented
-     * but won't run. To re-enable, uncomment the init below. */
-    // power_sensor_init();
-    // UARTprintf("Power sensor init (Timer0A -> ADC1 SS0 @ %d Hz)\n",
-    //            POWER_SENSOR_SAMPLE_HZ);
+    /* Let the GUI task finish LCD + touch init first (it runs at higher
+     * priority). Power ADC uses ADC1 only but must not run before touch
+     * has configured ADC0 SS3. */
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    /* DRV8323 ADC current sensing — Timer3A triggers ADC1 SS0 at 1 kHz. */
+#if MOTOR_ENABLE_POWER_SENSOR
+    power_sensor_init();
+    uart_log_printf("Power sensor ON (Timer3A -> ADC1 @ %d Hz, idle zero-cal)\n",
+                    POWER_SENSOR_SAMPLE_HZ);
+#else
+    xEventGroupClearBits(xSystemEvents, EVT_ESTOP_POWER);
+    uart_log_printf("Power sensor OFF (MOTOR_ENABLE_POWER_SENSOR=0)\n");
+#endif
 
     uart_log_printf("BMI160 init...\n");
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
@@ -233,7 +273,7 @@ static void prvSensorTask(void *pvParameters)
         TaskHandle_t hAccSamp = NULL;
         BaseType_t r = xTaskCreate(prvAccelSamplerTask, "AccSamp",
                     configMINIMAL_STACK_SIZE * 2, NULL,
-                    tskIDLE_PRIORITY + 5, &hAccSamp);
+                    tskIDLE_PRIORITY + 4, &hAccSamp);
         uart_log_printf("AccSamp task create -> %d  handle=%p\n",
                         (int)r, hAccSamp);
         prvAccelTimerInit();
@@ -268,7 +308,6 @@ static void prvSensorTask(void *pvParameters)
     float   raw_lux     = 0.0f;
     float   raw_total_g = 0.0f;
     uint32_t tick_count = 0;
-
     /* CSV header for the serial-plot tool (spec 2.2.5). All values
      * are integer-scaled to keep printf simple:
      *   p_raw_mw, p_filt_mw   power in milliwatts (W * 1000)
@@ -279,9 +318,18 @@ static void prvSensorTask(void *pvParameters)
      *   p_dhpa                pressure * 10            (hPa)
      *   rpm_raw, rpm_filt     RPM (integer)
      */
+    uart_log_printf("# sensor CSV @ 50 Hz: t,p_raw_mw,p_filt_mw,lux,acc...\n");
     uart_log_printf("t,p_raw_mw,p_filt_mw,lux_raw,lux_filt,"
                     "ax_mg,ay_mg,az_mg,acc_raw_mg,acc_filt_mg,"
                     "t_cc,h_cp,p_dhpa,rpm_raw,rpm_filt\n");
+
+#if MOTOR_ENABLE_POWER_SENSOR
+    g_motor_power_watts = 0.0f;
+    prvPowMAFReset();
+    power_sensor_drain_raw_queue();
+    power_sensor_adc_start();
+    uart_log_printf("Power ADC started; hold Idle ~0.3 s for zero-cal\n");
+#endif
 
     TickType_t xLastWake = xTaskGetTickCount();
 
@@ -290,16 +338,69 @@ static void prvSensorTask(void *pvParameters)
         vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
         tick_count++;
 
-        /* ---- Power: drain every raw ADC sample since last wake. */
+        int32_t rpm_now = speed_sensor_get_rpm();
+        if (rpm_now < 0)
+        {
+            rpm_now = 0;
+        }
+
+        /* ---- Power: average ADC samples since last wake (1 kHz ISR). */
         PowerSampleRaw_t psraw;
+        float   i_accum = 0.0f;
+        uint32_t i_samples = 0;
+        bool    motor_idle = (g_motor_state == MOTOR_STATE_IDLE ||
+                              g_motor_state == MOTOR_STATE_FAULT_LATCHED);
+
         while (xQueueReceive(xPowerRawQueue, &psraw, 0) == pdPASS)
         {
-            i_total_raw = power_sensor_counts_to_amps(psraw.ia_counts,
+#if MOTOR_ENABLE_POWER_SENSOR
+            if (motor_idle)
+            {
+                power_sensor_note_idle_sample(psraw.ia_counts, psraw.ib_counts);
+            }
+#endif
+            float i_inst = power_sensor_counts_to_amps(psraw.ia_counts,
                                                      psraw.ib_counts);
-            float i_filt = prvPowMAFUpdate(i_total_raw);
-            power_w = POWER_SENSOR_VOLTAGE_V * i_filt;
+            i_accum += i_inst;
+            i_samples++;
         }
-        if (g_motor_estop_armed && power_w > g_thresh_power_w)
+
+        if (!power_sensor_zero_ready() || motor_idle ||
+            !g_motor_power_estop_ok ||
+            rpm_now < POWER_ESTOP_MIN_RPM)
+        {
+            power_w = 0.0f;
+            prvPowMAFReset();
+            s_pwr_estop_cnt = 0;
+        }
+        else if (i_samples > 0u)
+        {
+            i_total_raw = i_accum / (float)i_samples;
+            power_w = power_sensor_amps_to_watts(prvPowMAFUpdate(i_total_raw));
+        }
+        else
+        {
+            power_w = 0.0f;
+        }
+
+        g_motor_power_watts = power_w;
+#if MOTOR_ENABLE_POWER_SENSOR
+        if (g_motor_power_estop_ok &&
+            power_sensor_zero_ready() &&
+            rpm_now >= POWER_ESTOP_MIN_RPM &&
+            power_w > g_thresh_power_w)
+        {
+            if (s_pwr_estop_cnt < 255u)
+            {
+                s_pwr_estop_cnt++;
+            }
+        }
+        else
+        {
+            s_pwr_estop_cnt = 0;
+        }
+
+        if (s_pwr_estop_cnt >= POWER_ESTOP_DEBOUNCE_TICKS)
         {
             xEventGroupSetBits(xSystemEvents, EVT_ESTOP_POWER);
         }
@@ -307,6 +408,9 @@ static void prvSensorTask(void *pvParameters)
         {
             xEventGroupClearBits(xSystemEvents, EVT_ESTOP_POWER);
         }
+#else
+        xEventGroupClearBits(xSystemEvents, EVT_ESTOP_POWER);
+#endif
 
         /* ---- Lux: poll OPT3001 at 5 Hz (every 10th tick). */
         if ((tick_count % LUX_READ_EVERY_N) == 0)
@@ -327,9 +431,12 @@ static void prvSensorTask(void *pvParameters)
                 xEventGroupClearBits(xSystemEvents, EVT_NIGHT_DETECTED);
         }
 
-        /* ---- Accel: drain Timer1A-fed queue. */
+        /* ---- Accel: drain Timer2A-fed queue. */
         AccelSampleRaw_t araw;
         const float lsb_per_g = bmi160_lsb_per_g();
+        float       peak_total_g = 0.0f;
+        bool        accel_estop_active = g_motor_power_estop_ok;
+
         while (xQueueReceive(xAccelRawQueue, &araw, 0) == pdPASS)
         {
             g_dbg_queue_drained++;
@@ -337,18 +444,17 @@ static void prvSensorTask(void *pvParameters)
             ay_g = (float)araw.ay_raw / lsb_per_g;
             az_g = (float)araw.az_raw / lsb_per_g;
             raw_total_g = prvAbsF(ax_g) + prvAbsF(ay_g) + prvAbsF(az_g);
-            /* Impact is a sharp spike: any averaging window smears it
-             * out, so we threshold the raw magnitude directly. Lux gets
-             * the 8-tap MAF instead (it's slowly varying). */
-            accel_mag = raw_total_g;
+            accel_mag = prvAccelMAFUpdate(raw_total_g);
+            if (raw_total_g > peak_total_g)
+            {
+                peak_total_g = raw_total_g;
+            }
         }
-        if (g_motor_estop_armed && accel_mag > g_thresh_accel_g)
+        /* E-stop: peak |ax|+|ay|+|az| (no MAF) so firm shakes are not averaged away.
+         * Latch the event bit until motor ACK — do not clear when below. */
+        if (accel_estop_active && peak_total_g > g_thresh_accel_g)
         {
             xEventGroupSetBits(xSystemEvents, EVT_ESTOP_ACCEL);
-        }
-        else
-        {
-            xEventGroupClearBits(xSystemEvents, EVT_ESTOP_ACCEL);
         }
 
         /* ---- Environment: 1 Hz read.
@@ -405,12 +511,11 @@ static void prvSensorTask(void *pvParameters)
         /* Diagnostic dump every 50 ticks (1 s). */
         if ((tick_count % 50) == 0)
         {
-            uart_log_printf("DBG  T2A=%u  AccRun=%u  RdOK=%u  RdFail=%u  Drained=%u\n",
+            uart_log_printf("DBG  T2A=%u  I_mA=%d  P_mW=%d  AccRun=%u\n",
                             (unsigned)g_dbg_timer2a_irqs,
-                            (unsigned)g_dbg_accsamp_runs,
-                            (unsigned)g_dbg_accsamp_reads_ok,
-                            (unsigned)g_dbg_accsamp_reads_fail,
-                            (unsigned)g_dbg_queue_drained);
+                            (int)(i_total_raw * 1000.0f),
+                            (int)(power_w * 1000.0f),
+                            (unsigned)g_dbg_accsamp_runs);
         }
 
         /* ---- Serial plot: one CSV line per tick (50 Hz). */
