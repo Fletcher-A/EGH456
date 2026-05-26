@@ -16,7 +16,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "drivers/i2cOptDriver.h"
+#include "drivers/i2cSHT31Driver.h"
 #include "drivers/sht31.h"
 
 /*-----------------------------------------------------------*/
@@ -34,7 +34,7 @@ bool sht31_init(void)
 {
     /* writeI2C1 returns false if the slave NACKs the address byte —
      * exactly what we want when the SHT31 isn't fitted. */
-    return writeI2C1(SHT31_ADDR, SHT31_RESET_HI, SHT31_RESET_LO);
+    return writeI2C2Single(SHT31_ADDR, SHT31_RESET_HI, SHT31_RESET_LO);
 }
 
 bool sht31_read(float *temp_c, float *humidity_rh)
@@ -42,10 +42,10 @@ bool sht31_read(float *temp_c, float *humidity_rh)
     uint8_t d[OUTPUT_LENGTH];
 
     /* Kick off a single-shot conversion. If the chip isn't on the bus
-     * the write NACKs and we abort — the caller's *temp_c/*humidity_rh
+     * the write NACKs and we abort — the caller's temp_c/humidity_rh
      * stay untouched so the GUI shows the previous value (or zero on
      * first call), not random noise from an unrelated transaction. */
-    if (!writeI2C1(SHT31_ADDR, SHT31_FIRST_BIT, SHT31_SECOND_BIT))
+    if (!writeI2C2Single(SHT31_ADDR, SHT31_FIRST_BIT, SHT31_SECOND_BIT))
         return false;
 
     /* Chip needs ~15 ms in high-rep mode before data is valid. */

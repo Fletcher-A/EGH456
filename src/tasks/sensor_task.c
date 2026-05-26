@@ -239,6 +239,7 @@ static void prvSensorTask(void *pvParameters)
      * sampler task runs at a higher priority and would otherwise
      * pre-empt mid-transaction. */
     initI2C(g_ui32SysClock);
+    initI2C2(g_ui32SysClock);
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     sensorOpt3001Init();
     xSemaphoreGive(xI2CMutex);
