@@ -1605,7 +1605,7 @@ static void prvRedrawWidgets(void)
              * Cheap O(days) loop; demo never runs long enough to feel it. */
             #define BASE_YEAR  2026
             #define BASE_MONTH 5
-            #define BASE_DAY   26
+            #define BASE_DAY   27
             static const int days_in_month[12] =
                 { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
             uint32_t days = sec / 86400u;
