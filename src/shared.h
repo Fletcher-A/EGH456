@@ -149,6 +149,14 @@ extern volatile MotorState_t g_motor_state;
 
 extern volatile bool g_motor_estop_armed;
 extern volatile bool g_motor_power_estop_ok;
+extern volatile int32_t g_plot_rpm_desired;
+extern volatile int32_t g_plot_rpm_reference;
+extern volatile int32_t g_plot_rpm_actual;
+extern volatile int32_t g_serial_plot_lux;
+extern volatile int32_t g_serial_plot_accel_mg;
+#ifndef SERIAL_PLOT_CLEAN
+#define SERIAL_PLOT_CLEAN  1
+#endif
 
 /*-----------------------------------------------------------*/
 /* Advanced feature: "ACC" (adaptive cruise control) supervisor.

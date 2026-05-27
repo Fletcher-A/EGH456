@@ -90,7 +90,9 @@ void motor_driver_init(void)
 {
     prvInitDrvNfaultInput();
     s_motorlib_ok = initMotorLib(MOTOR_PWM_PERIOD_US);
+#if !SERIAL_PLOT_CLEAN
     UARTprintf("MotorLib init: %s\n", s_motorlib_ok ? "OK" : "FAILED");
+#endif
     setDuty(0);
     disableMotor();
     speed_sensor_init();

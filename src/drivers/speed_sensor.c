@@ -47,7 +47,8 @@
 static volatile uint32_t g_edges = 0;     /* hall sector changes per tick window */
 static volatile int32_t  g_rpm_raw  = 0;
 static volatile int32_t  g_rpm_filt = 0;
-static volatile int32_t  g_rpm_display = 0; /* extra-smoothed RPM for GUI/plot */
+static volatile int32_t  g_rpm_display = 0; /* GUI/plot RPM (tracks integrated meas.) */
+static volatile int32_t  g_rpm_disp_meas = 0; /* latest 30 ms hall average */
 static uint32_t          s_disp_edges_sum = 0;
 static uint8_t           s_disp_integ_cnt = 0;
 static uint32_t          s_ctrl_edges_sum = 0;
@@ -55,14 +56,36 @@ static uint8_t           s_ctrl_integ_cnt = 0;
 static uint8_t           s_hall_prev = 0xFF;  /* force first sample to count */
 static bool              s_hall_irq_on = true;
 
+/* GUI: track integrated hall RPM quickly (old >>3 slew lagged hundreds of RPM). */
 static void prvRpmDisplayUpdate(int32_t rpm_meas)
 {
+    g_rpm_disp_meas = rpm_meas;
+
+    if (g_motor_state == MOTOR_STATE_IDLE ||
+        g_motor_state == MOTOR_STATE_FAULT_LATCHED)
+    {
+        g_rpm_display = 0;
+        return;
+    }
+
     int32_t d = rpm_meas - g_rpm_display;
-    int32_t cap = 80;
+    int32_t cap = 200;
+
     if (g_motor_state == MOTOR_STATE_RUNNING)
     {
-        cap = 40;
+        /* Near setpoint: show live reading; large error: catch up fast. */
+        if (d > -80 && d < 80)
+        {
+            g_rpm_display = rpm_meas;
+            return;
+        }
+        cap = 150;
     }
+    else if (g_motor_state == MOTOR_STATE_STARTING)
+    {
+        cap = 80;
+    }
+
     if (d > cap)
     {
         d = cap;
@@ -71,7 +94,8 @@ static void prvRpmDisplayUpdate(int32_t rpm_meas)
     {
         d = -cap;
     }
-    g_rpm_display += d >> 3;
+    /* ~75% of error per 30 ms window while ramping. */
+    g_rpm_display += (d * 3) >> 2;
 
     if (g_rpm_display > MAX_MOTOR_RPM)
     {
@@ -389,6 +413,7 @@ void speed_sensor_reset_filter(void)
     g_rpm_raw  = 0;
     g_rpm_filt = 0;
     g_rpm_display = 0;
+    g_rpm_disp_meas = 0;
     s_disp_edges_sum = 0;
     s_disp_integ_cnt = 0;
     s_ctrl_edges_sum = 0;
@@ -410,6 +435,7 @@ void speed_sensor_seed_filter(int32_t rpm)
     g_rpm_raw     = rpm;
     g_rpm_filt    = rpm;
     g_rpm_display = rpm;
+    g_rpm_disp_meas = rpm;
     s_ctrl_edges_sum = 0;
     s_ctrl_integ_cnt = 0;
     IntMasterEnable();
@@ -420,10 +446,18 @@ int32_t speed_sensor_get_rpm_raw(void)   { return g_rpm_raw;  }
 
 int32_t speed_sensor_get_rpm_display(void)
 {
-    /* When slowing, follow the fast 10 ms window so the plot drops promptly. */
-    if (g_rpm_raw < g_rpm_filt || g_rpm_raw < g_rpm_display)
+    /* Prefer the integrated measurement; drop quickly on decel. */
+    if (g_motor_state == MOTOR_STATE_STOPPING ||
+        g_motor_state == MOTOR_STATE_ESTOP_BRAKING)
     {
-        return g_rpm_raw;
+        if (g_rpm_raw < g_rpm_display)
+        {
+            return g_rpm_raw;
+        }
+    }
+    if (g_rpm_disp_meas > 0 && g_rpm_display < g_rpm_disp_meas - 30)
+    {
+        return g_rpm_disp_meas;
     }
     return g_rpm_display;
 }

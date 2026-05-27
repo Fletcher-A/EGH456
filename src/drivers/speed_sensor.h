@@ -27,7 +27,7 @@
 #include <stdbool.h>
 
 #define SPEED_EDGES_PER_REV     24      /* 6 * pole_pairs */
-#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  5
+#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  3
 #define SPEED_RPM_CTRL_INTEGRATE_TICKS     3
 
 void    speed_sensor_init(void);

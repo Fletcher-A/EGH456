@@ -26,3 +26,21 @@ void uart_log_printf(const char *pcFormat, ...)
     uart_log_vprintf(pcFormat, vaArgP);
     va_end(vaArgP);
 }
+
+void uart_plot_printf(const char *pcFormat, ...)
+{
+    va_list vaArgP;
+
+    va_start(vaArgP, pcFormat);
+    /* Plot task is the only CSV writer; avoid dropping lines on mutex timeout. */
+    if (xUARTMutex != NULL)
+    {
+        xSemaphoreTake(xUARTMutex, portMAX_DELAY);
+    }
+    UARTvprintf(pcFormat, vaArgP);
+    if (xUARTMutex != NULL)
+    {
+        xSemaphoreGive(xUARTMutex);
+    }
+    va_end(vaArgP);
+}

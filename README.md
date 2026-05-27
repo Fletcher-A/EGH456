@@ -26,9 +26,11 @@ Layout: `src/tasks/` (motor / sensor / gui / fault), `src/drivers/`, `src/main.c
 ## Demonstration procedure
 
 1. **Build / flash:** `pio run -t upload`
-2. **Serial monitor:** 115200 baud — boot log + two CSV streams:
-   - `# motor: M,desired,reference,actual,duty_pct` then `M,...` @ 100 Hz
-   - `# sensor CSV @ 50 Hz` then `t,p_raw_mw,...` @ 50 Hz
+2. **Serial plot** ([atomic14 Web Serial Plotter](https://web-serial-plotter.atomic14.com/) or monitor): **115200 baud**, close other serial tools first.
+   - With `SERIAL_PLOT_CLEAN=1` (default): `#` header once, then CSV @ 50 Hz. Columns:
+     `sample_number`, `desired_rpm`, `reference_rpm`, `actual_rpm`, `duty_percent`, `power_milliwatts`, `light_lux`, `acceleration_millig`, `hall_display_rpm`
+   - Reset board after connect so the plotter catches the `#` header (do not repeat the header in firmware).
+   - Legacy mode (`-DSERIAL_PLOT_CLEAN=0`): `M,...` motor + 15-column sensor CSV (desktop Serial Plot).
 3. **Power zero-cal:** leave **Idle** ~0.5 s before **START** (SOA/SOB ADC offset).
 4. **Thresholds tab:** Power **300 W** default (range 50–300 W) for full-speed bench test; use **150 W** for safety demo if required.
 5. **START** → **Running** → raise slider to 4000 RPM; verify ramps (500 RPM/s) on motor plot.

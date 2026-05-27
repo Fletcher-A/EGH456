@@ -44,6 +44,7 @@
 #include <math.h>
 #include "i2cOptDriver.h"
 #include "opt3001.h"
+#include "shared.h"
 #include "utils/uartstdio.h"
 
 /* ------------------------------------------------------------------------------------------------
@@ -214,7 +215,9 @@ bool sensorOpt3001Test(void)
 		return false;
 	}
 
+#if !SERIAL_PLOT_CLEAN
 	UARTprintf("Manufacturer ID Correct: %c%c\n", (val >> 8) & 0x00FF, val & 0x00FF);
+#endif
 
 	// Check device ID
 	if (!readI2C(OPT3001_I2C_ADDRESS, REG_DEVICE_ID, (uint8_t *)&val))
@@ -230,7 +233,9 @@ bool sensorOpt3001Test(void)
 		return false;
 	}
 
+#if !SERIAL_PLOT_CLEAN
 	UARTprintf("Device ID Correct: %02x%02x\n", (val >> 8) & 0x00FF, val & 0x00FF);
+#endif
 
 	return true;
 }

@@ -40,7 +40,8 @@
  *
  * PAGES
  * -----
- *   Page 0 — Control: state text, status indicator, RPM/power/lux
+ *   Page 0 — Control: state text, status indicator (green/orange/yellow/red),
+ *                     RPM/power/lux
  *                     readouts, speed slider, START/STOP/ACK buttons,
  *                     clock, day/night text + LED, threshold label.
  *   Page 1 — Plots:   scrolling RPM/Power/Lux traces with axis labels.
@@ -113,6 +114,7 @@ static float        g_accel_g         = 0.0f;   /* filtered Y, used by plot */
 static float        g_accel_x_g       = 0.0f;
 static float        g_accel_y_g       = 0.0f;
 static float        g_accel_z_g       = 0.0f;
+static float        g_accel_total_g   = 0.0f;   /* |ax|+|ay|+|az| for status LED */
 static float        g_temp_c          = 0.0f;
 static float        g_humidity_pct    = 0.0f;
 static float        g_pressure_hpa    = 0.0f;
@@ -1123,6 +1125,50 @@ static void prvProcessTouchMessages(void)
     }
 }
 
+/* Control-tab status indicator (rectangle at x=250): green=Running,
+ * orange=Idle/Starting/Stopping, yellow=high |a|, red=fault/E-stop. */
+static uint32_t prvStatusIndicatorColor(void)
+{
+    if (g_state == MOTOR_STATE_ESTOP_BRAKING ||
+        g_state == MOTOR_STATE_FAULT_LATCHED)
+    {
+        return ClrRed;
+    }
+    if (g_accel_total_g >= g_thresh_accel_g)
+    {
+        return ClrYellow;
+    }
+    if (g_state == MOTOR_STATE_RUNNING)
+    {
+        return ClrLimeGreen;
+    }
+    return ClrOrange;
+}
+
+static const char *prvStatusStateName(void)
+{
+    switch (g_state)
+    {
+    case MOTOR_STATE_IDLE:          return "Idle";
+    case MOTOR_STATE_STARTING:      return "Starting";
+    case MOTOR_STATE_RUNNING:       return "Running";
+    case MOTOR_STATE_STOPPING:      return "Stopping";
+    case MOTOR_STATE_ESTOP_BRAKING: return "E-Stop Brake";
+    case MOTOR_STATE_FAULT_LATCHED: return "Fault Latched";
+    default:                        return "Idle";
+    }
+}
+
+static void prvRefreshStatusIndicator(void)
+{
+    uint32_t col = prvStatusIndicatorColor();
+
+    CanvasTextSet(&g_sStateText, (char *)prvStatusStateName());
+    WidgetPaint((tWidget *)&g_sStateText);
+    g_sStatusIndicator.ui32FillColor = col;
+    WidgetPaint((tWidget *)&g_sStatusIndicator);
+}
+
 /* Control-tab status line under thresholds (fault text, duty debug, etc.). */
 static char s_status_line_buf[48];
 
@@ -1414,25 +1460,22 @@ static void prvRedrawWidgets(void)
         static char s_clock_buf[24];
         static bool last_acc_on = (bool)-1;
 
-        if (g_state != last_state)
+        static uint32_t last_status_col = 0xFFFFFFFFu;
+        static int      last_accel_100  = -1;
+
         {
-            const char *name = "Idle";
-            uint32_t    col  = ClrOrange;
-            switch (g_state)
+            uint32_t col = prvStatusIndicatorColor();
+            int      a100 = (int)(g_accel_total_g * 100.0f + 0.5f);
+
+            if (g_state != last_state || col != last_status_col ||
+                a100 != last_accel_100)
             {
-            case MOTOR_STATE_IDLE:          name = "Idle";          col = ClrOrange;    break;
-            case MOTOR_STATE_STARTING:      name = "Starting";      col = ClrOrange;    break;
-            case MOTOR_STATE_RUNNING:       name = "Running";       col = ClrLimeGreen; break;
-            case MOTOR_STATE_STOPPING:      name = "Stopping";      col = ClrOrange;    break;
-            case MOTOR_STATE_ESTOP_BRAKING: name = "E-Stop Brake";  col = ClrRed;       break;
-            case MOTOR_STATE_FAULT_LATCHED: name = "Fault Latched"; col = ClrRed;       break;
+                prvRefreshStatusIndicator();
+                last_state = g_state;
+                last_status_col = col;
+                last_accel_100 = a100;
+                last_fault_bits = (EventBits_t)-1;
             }
-            CanvasTextSet(&g_sStateText, (char *)name);
-            WidgetPaint((tWidget *)&g_sStateText);
-            g_sStatusIndicator.ui32FillColor = col;
-            WidgetPaint((tWidget *)&g_sStatusIndicator);
-            last_state = g_state;
-            last_fault_bits = (EventBits_t)-1;
         }
 
         if (g_fault_bits != last_fault_bits)
@@ -1488,9 +1531,9 @@ static void prvRedrawWidgets(void)
              * in the model but we only redraw when change is visible. */
             static TickType_t last_rpm_paint = 0;
             TickType_t now_rpm = xTaskGetTickCount();
-            bool big_change = (d_act >= 20 || d_ref >= 20 || d_des >= 20);
+            bool big_change = (d_act >= 8 || d_ref >= 8 || d_des >= 8);
             bool paint_rpm = (last_rpm < 0) || big_change ||
-                             (now_rpm - last_rpm_paint >= pdMS_TO_TICKS(250));
+                             (now_rpm - last_rpm_paint >= pdMS_TO_TICKS(100));
 
             last_rpm     = g_rpm_actual;
             last_rpm_ref = g_rpm_reference;
@@ -1725,13 +1768,17 @@ static void prvGuiTask(void *pvParameters)
     uDMAControlBaseSet(&s_DMAControlTable[0]);
     uDMAEnable();
 
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("GUI: LCD init...\n");
+#endif
 
     /* LCD + grlib + touch. */
     Kentec320x240x16_SSD2119Init(g_ui32SysClock);
     GrContextInit(&sContext, &g_sKentec320x240x16_SSD2119);
     TouchScreenInit(g_ui32SysClock);
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("GUI: LCD + touch ready\n");
+#endif
     TouchScreenCallbackSet(WidgetPointerMessage);
 
     /* Initial widget tree. */
@@ -1777,6 +1824,7 @@ static void prvGuiTask(void *pvParameters)
             g_accel_x_g    = sensor_msg.accel_x_g;
             g_accel_y_g    = sensor_msg.accel_y_g;
             g_accel_z_g    = sensor_msg.accel_z_g;
+            g_accel_total_g = sensor_msg.accel_total_g;
             g_accel_g      = sensor_msg.accel_y_g;   /* plot uses Y, signed */
             g_temp_c       = sensor_msg.temp_c;
             g_humidity_pct = sensor_msg.humidity_pct;

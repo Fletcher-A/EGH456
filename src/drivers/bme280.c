@@ -18,6 +18,7 @@
 #include "task.h"
 #include "drivers/i2cOptDriver.h"
 #include "drivers/bme280.h"
+#include "shared.h"
 #include "utils/uartstdio.h"
 
 /*-----------------------------------------------------------*/
@@ -85,9 +86,11 @@ bool bme280_init(void)
         if (readI2C(g_bme_addr, REG_CHIP_ID, id_buf) && id_buf[0] == BME_CHIP_ID)
             found = true;
     }
+#if !SERIAL_PLOT_CLEAN
     UARTprintf("  BME280 probe: %s at 0x%02x  id=0x%02x\n",
                found ? "found" : "NOT FOUND",
                g_bme_addr, found ? id_buf[0] : 0xFFu);
+#endif
     if (!found) return false;
 
     writeI2C1(g_bme_addr, REG_RESET, CMD_SOFT_RESET);

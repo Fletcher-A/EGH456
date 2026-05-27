@@ -173,6 +173,17 @@ extern volatile bool g_motor_estop_armed;
 /* False during soft-start; sensor power E-stop waits for this. */
 extern volatile bool g_motor_power_estop_ok;
 
+/* Snapshot for SERIAL_PLOT_CLEAN UART line (updated by motor_task). */
+extern volatile int32_t g_plot_rpm_desired;
+extern volatile int32_t g_plot_rpm_reference;
+extern volatile int32_t g_plot_rpm_actual;
+extern volatile int32_t g_serial_plot_lux;
+extern volatile int32_t g_serial_plot_accel_mg;
+
+#ifndef SERIAL_PLOT_CLEAN
+#define SERIAL_PLOT_CLEAN  1
+#endif
+
 /*-----------------------------------------------------------*/
 /* Advanced feature: "ACC" (adaptive cruise control) supervisor.
  *

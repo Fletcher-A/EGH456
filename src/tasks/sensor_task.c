@@ -204,7 +204,9 @@ void Timer2AIntHandler(void)
 static void prvAccelSamplerTask(void *pvParameters)
 {
     (void)pvParameters;
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("AccSamp task started, sem=%p\n", s_xAccelTickSem);
+#endif
     for (;;)
     {
         if (xSemaphoreTake(s_xAccelTickSem, portMAX_DELAY) != pdTRUE) continue;
@@ -252,48 +254,70 @@ static void prvSensorTask(void *pvParameters)
     /* DRV8323 ADC current sensing — Timer3A triggers ADC1 SS0 at 1 kHz. */
 #if MOTOR_ENABLE_POWER_SENSOR
     power_sensor_init();
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("Power sensor ON (Timer3A -> ADC1 @ %d Hz, idle zero-cal)\n",
                     POWER_SENSOR_SAMPLE_HZ);
+#endif
 #else
     xEventGroupClearBits(xSystemEvents, EVT_ESTOP_POWER);
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("Power sensor OFF (MOTOR_ENABLE_POWER_SENSOR=0)\n");
 #endif
+#endif
 
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("BMI160 init...\n");
+#endif
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool bmi_ok = bmi160_init();
     xSemaphoreGive(xI2CMutex);
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("BMI160 %s\n", bmi_ok ? "ready" : "init FAILED");
+#endif
 
     /* Spin up the 200 Hz accel sampling pipeline only if the IMU
      * came up. Otherwise we'd queue zeroes forever. */
     if (bmi_ok)
     {
         s_xAccelTickSem = xSemaphoreCreateBinary();
+#if !SERIAL_PLOT_CLEAN
         uart_log_printf("AccSem create -> %p\n", s_xAccelTickSem);
+#endif
         TaskHandle_t hAccSamp = NULL;
         BaseType_t r = xTaskCreate(prvAccelSamplerTask, "AccSamp",
                     configMINIMAL_STACK_SIZE * 2, NULL,
                     tskIDLE_PRIORITY + 4, &hAccSamp);
+#if !SERIAL_PLOT_CLEAN
         uart_log_printf("AccSamp task create -> %d  handle=%p\n",
                         (int)r, hAccSamp);
+#endif
         prvAccelTimerInit();
+#if !SERIAL_PLOT_CLEAN
         uart_log_printf("Accel sampler (Timer2A @ %d Hz)\n", ACCEL_SAMPLE_HZ);
+#endif
     }
 
     /* SHT31 (T+RH, spec 2.2.2 primary) — required */
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("SHT31 init...\n");
+#endif
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool sht_ok = sht31_init();
     xSemaphoreGive(xI2CMutex);
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("SHT31 %s\n", sht_ok ? "ready" : "init FAILED");
+#endif
 
     /* BME280 (pressure only — T+H come from SHT31). */
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("BME280 init...\n");
+#endif
     xSemaphoreTake(xI2CMutex, portMAX_DELAY);
     bool bme_ok = bme280_init();
     xSemaphoreGive(xI2CMutex);
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("BME280 %s\n", bme_ok ? "ready" : "init FAILED");
+#endif
 
     float    light_lux  = 0.0f;
     float    accel_mag  = 0.0f;
@@ -319,17 +343,21 @@ static void prvSensorTask(void *pvParameters)
      *   p_dhpa                pressure * 10            (hPa)
      *   rpm_raw, rpm_filt     RPM (integer)
      */
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("# sensor CSV @ 50 Hz: t,p_raw_mw,p_filt_mw,lux,acc...\n");
     uart_log_printf("t,p_raw_mw,p_filt_mw,lux_raw,lux_filt,"
                     "ax_mg,ay_mg,az_mg,acc_raw_mg,acc_filt_mg,"
                     "t_cc,h_cp,p_dhpa,rpm_raw,rpm_filt\n");
+#endif
 
 #if MOTOR_ENABLE_POWER_SENSOR
     g_motor_power_watts = 0.0f;
     prvPowMAFReset();
     power_sensor_drain_raw_queue();
     power_sensor_adc_start();
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("Power ADC started; hold Idle ~0.3 s for zero-cal\n");
+#endif
 #endif
 
     TickType_t xLastWake = xTaskGetTickCount();
@@ -385,6 +413,8 @@ static void prvSensorTask(void *pvParameters)
         }
 
         g_motor_power_watts = power_w;
+        g_serial_plot_lux       = (int32_t)light_lux;
+        g_serial_plot_accel_mg  = (int32_t)(accel_mag * 1000.0f);
 #if MOTOR_ENABLE_POWER_SENSOR
         if (g_motor_power_estop_ok &&
             power_sensor_zero_ready() &&
@@ -509,6 +539,7 @@ static void prvSensorTask(void *pvParameters)
             xQueueSend(xSensorQueue, &msg, 0);
         }
 
+#if !SERIAL_PLOT_CLEAN
         /* Diagnostic dump every 50 ticks (1 s). */
         if ((tick_count % 50) == 0)
         {
@@ -519,7 +550,7 @@ static void prvSensorTask(void *pvParameters)
                             (unsigned)g_dbg_accsamp_runs);
         }
 
-        /* ---- Serial plot: one CSV line per tick (50 Hz). */
+        /* Verbose sensor CSV @ 50 Hz (15 columns). */
         uart_log_printf("%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                         (unsigned)tick_count,
                         (int)(i_total_raw * POWER_SENSOR_VOLTAGE_V * 1000),
@@ -536,6 +567,7 @@ static void prvSensorTask(void *pvParameters)
                         (int)(pres_hpa * 10),
                         (int)speed_sensor_get_rpm_raw(),
                         (int)speed_sensor_get_rpm());
+#endif
     }
 }
 

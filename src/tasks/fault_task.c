@@ -61,7 +61,9 @@ static void prvFaultTask(void *pvParameters)
     (void)pvParameters;
     EventBits_t last_logged = 0;
 
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("Fault task ready (waits on EVT_ESTOP_* / EVT_SENSOR_FAULT)\n");
+#endif
 
     for (;;)
     {

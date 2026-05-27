@@ -11,5 +11,7 @@
 
 void uart_log_printf(const char *pcFormat, ...);
 void uart_log_vprintf(const char *pcFormat, va_list vaArgP);
+/* Plot CSV: waits longer for UART mutex so 50 Hz lines are not dropped. */
+void uart_plot_printf(const char *pcFormat, ...);
 
 #endif /* UART_LOG_H */

@@ -53,6 +53,11 @@ volatile uint16_t g_motor_pwm_duty_pct = 0;
 volatile MotorState_t g_motor_state  = MOTOR_STATE_IDLE;
 volatile bool  g_motor_estop_armed   = false;
 volatile bool  g_motor_power_estop_ok = false;
+volatile int32_t g_plot_rpm_desired    = 0;
+volatile int32_t g_plot_rpm_reference  = 0;
+volatile int32_t g_plot_rpm_actual     = 0;
+volatile int32_t g_serial_plot_lux       = 0;
+volatile int32_t g_serial_plot_accel_mg  = 0;
 volatile bool  g_acc_enabled         = false;
 volatile float g_virtual_distance_mm = 500.0f;
 EventGroupHandle_t xSystemEvents  = NULL;
@@ -65,6 +70,7 @@ extern void vCreateMotorTask(void);
 extern void vCreateSensorTask(void);
 extern void vCreateGuiTask(void);
 extern void vCreateFaultTask(void);
+extern void vCreateSerialPlotTask(void);
 
 static void prvSetupHardware(void);
 static void prvConfigureUART(void);
@@ -93,8 +99,13 @@ int main(void)
         for (;;) {}     /* RTOS object creation failed */
     }
 
+    /* One plain-text line so PlatformIO monitor / serialplotter show life
+     * even when SERIAL_PLOT_CLEAN suppresses all task boot logs. */
+    UARTprintf("\nEGH456 UART 115200 - plot CSV after # header line\n");
+
     /* Spawn tasks — GUI before sensor so display init is not starved. */
     vCreateGuiTask();
+    vCreateSerialPlotTask();
     vCreateSensorTask();
     vCreateMotorTask();
     vCreateFaultTask();

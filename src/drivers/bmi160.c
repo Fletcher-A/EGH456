@@ -16,6 +16,7 @@
 #include "task.h"
 #include "drivers/i2cOptDriver.h"
 #include "drivers/bmi160.h"
+#include "shared.h"
 #include "utils/uartstdio.h"
 
 /*-----------------------------------------------------------*/
@@ -78,9 +79,11 @@ bool bmi160_init(void)
             id_bytes[0] == BMI160_CHIP_ID)
             found = true;
     }
+#if !SERIAL_PLOT_CLEAN
     UARTprintf("  BMI160 probe: %s at 0x%02x  id=0x%02x\n",
                found ? "found" : "NOT FOUND",
                g_bmi_addr, found ? id_bytes[0] : 0xFFu);
+#endif
     if (!found) return false;
 
     /* Bring accel to NORMAL power mode. ~4 ms transition; pad to be safe. */
@@ -97,7 +100,9 @@ bool bmi160_init(void)
     if (readI2C(g_bmi_addr, REG_PMU_STATUS, pmu))
     {
         uint8_t acc_pmu = (pmu[0] >> 4) & 0x3;
+#if !SERIAL_PLOT_CLEAN
         UARTprintf("  BMI160 PMU=0x%02x acc_pmu=%u\n", pmu[0], acc_pmu);
+#endif
         if (acc_pmu != 1) return false;
     }
 

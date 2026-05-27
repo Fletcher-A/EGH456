@@ -303,8 +303,10 @@ static void prvMotorTask(void *pvParameters)
 
     TickType_t xLastWake = xTaskGetTickCount();
 
+#if !SERIAL_PLOT_CLEAN
     uart_log_printf("Motor task: PI closed-loop, ramps 500/1000 RPM/s\n");
     uart_log_printf("Power ADC uses Timer3 (Timer0 reserved for MotorLib)\n");
+#endif
 
     for (;;)
     {
@@ -656,27 +658,30 @@ static void prvMotorTask(void *pvParameters)
         g_motor_state = state;
         g_motor_pwm_duty_pct = pwm_duty;
 
-        /* GUI/plot: filtered RPM, capped so open-loop bursts do not show 4000. */
+        /* GUI: live hall RPM (only cap startup spikes, not steady-state low). */
         rpm_actual = speed_sensor_get_rpm_display();
         if (rpm_actual < 0)
         {
             rpm_actual = 0;
         }
-        if (state == MOTOR_STATE_STARTING)
+        if (state == MOTOR_STATE_STARTING &&
+            rpm_actual > (int32_t)MOTOR_START_HALL_RPM_CAP)
         {
-            if (rpm_actual > (int32_t)MOTOR_START_HALL_RPM_CAP)
-            {
-                rpm_actual = (int32_t)MOTOR_START_HALL_RPM_CAP;
-            }
+            rpm_actual = (int32_t)MOTOR_START_HALL_RPM_CAP;
         }
-        else if (state == MOTOR_STATE_RUNNING)
+        else if (state == MOTOR_STATE_RUNNING &&
+                 rpm_actual > rpm_reference + (int32_t)MOTOR_RUN_MAX_OVERSPEED_RPM)
         {
-            rpm_actual = prvRpmForControl(rpm_reference, rpm_actual);
+            rpm_actual = rpm_reference + (int32_t)MOTOR_RUN_MAX_OVERSPEED_RPM;
         }
         if (rpm_actual > MAX_COMMAND_RPM)
         {
             rpm_actual = MAX_COMMAND_RPM;
         }
+
+        g_plot_rpm_desired   = rpm_desired_eff;
+        g_plot_rpm_reference = rpm_reference;
+        g_plot_rpm_actual    = rpm_actual;
 
         MotorMsgObj msg;
         msg.seq           = ++seq;
@@ -692,8 +697,8 @@ static void prvMotorTask(void *pvParameters)
         msg.motor_ready   = motor_driver_is_ready();
         xQueueSend(xMotorQueue, &msg, pdMS_TO_TICKS(1));
 
-        /* Motor serial plot stream (spec 2.1.9) @ 100 Hz — separate from
-         * the sensor CSV line; prefix M, for Serial Plot / Tera Term. */
+#if !SERIAL_PLOT_CLEAN
+        /* Legacy stream: M-prefix + 15-col sensor CSV (Tera Term / Serial Plot desktop). */
         if (!motor_csv_hdr)
         {
             uart_log_printf("# motor: M,desired,reference,actual,duty_pct\n");
@@ -704,6 +709,7 @@ static void prvMotorTask(void *pvParameters)
                         (int)rpm_reference,
                         (int)rpm_actual,
                         (unsigned)pwm_duty);
+#endif
     }
 }
 

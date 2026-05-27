@@ -27,9 +27,8 @@
 
 #define SPEED_EDGES_PER_REV     24      /* 6 * pole_pairs */
 
-/* GUI/plot: integrate hall edges over this many 10 ms ticks (50 ms) so
- * +/-1 edge quantization does not show as +/-200 RPM jitter on the plot. */
-#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  5
+/* GUI/plot: integrate hall edges over 30 ms (3 x 10 ms) — live but stable. */
+#define SPEED_RPM_DISPLAY_INTEGRATE_TICKS  3
 /* PI feedback: shorter window than display — smooth without lagging the ramp. */
 #define SPEED_RPM_CTRL_INTEGRATE_TICKS     3
 
