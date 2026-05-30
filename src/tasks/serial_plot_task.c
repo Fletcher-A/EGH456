@@ -8,13 +8,25 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "shared.h"
-#include "drivers/speed_sensor.h"
 #include "utils/uart_log.h"
 #include "utils/uartstdio.h"
 
 #if SERIAL_PLOT_CLEAN
 
 #define PLOT_PERIOD_MS  20
+/* 0/1 is invisible on a 0–4000 RPM plot — use full-scale step when E-stop is active. */
+#define PLOT_ESTOP_INACTIVE_VALUE  0
+#define PLOT_ESTOP_ACTIVE_VALUE    ((int)MAX_MOTOR_RPM)
+
+static int prvPlotEstopStep(void)
+{
+    if (g_motor_state == MOTOR_STATE_ESTOP_BRAKING ||
+        g_motor_state == MOTOR_STATE_FAULT_LATCHED)
+    {
+        return PLOT_ESTOP_ACTIVE_VALUE;
+    }
+    return PLOT_ESTOP_INACTIVE_VALUE;
+}
 
 static void prvSerialPlotTask(void *pvParameters)
 {
@@ -28,14 +40,14 @@ static void prvSerialPlotTask(void *pvParameters)
      * like traces stuck on the right forever). Use \\n only (uartstdio adds \\r). */
     uart_plot_printf("# sample_number desired_rpm reference_rpm actual_rpm "
                      "duty_percent power_milliwatts light_lux "
-                     "acceleration_millig hall_display_rpm\n");
+                     "acceleration_millig hall_display_rpm estop_active\n");
 
     for (;;)
     {
         vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(PLOT_PERIOD_MS));
         line++;
 
-        uart_plot_printf("%u,%d,%d,%d,%u,%d,%d,%d,%d\n",
+        uart_plot_printf("%u,%d,%d,%d,%u,%d,%d,%d,%d,%d\n",
                          (unsigned)line,
                          (int)g_plot_rpm_desired,
                          (int)g_plot_rpm_reference,
@@ -44,7 +56,8 @@ static void prvSerialPlotTask(void *pvParameters)
                          (int)(g_motor_power_watts * 1000.0f),
                          (int)g_serial_plot_lux,
                          (int)g_serial_plot_accel_mg,
-                         (int)speed_sensor_get_rpm_display());
+                         (int)g_plot_rpm_actual,
+                         prvPlotEstopStep());
     }
 }
 

@@ -411,6 +411,7 @@ static void prvMotorTask(void *pvParameters)
                 brake_ticks = 0;
                 s_stop_duty_milli =
                     (int32_t)motor_driver_get_duty_percent() * 1000;
+                rpm_desired = 0;
                 state = MOTOR_STATE_ESTOP_BRAKING;
                 prvClearCommandQueue();
             }
@@ -424,7 +425,9 @@ static void prvMotorTask(void *pvParameters)
 
         prvHandleHardwareDriverFault(&state, &fault_bits, &brake_ticks);
 
-        if (state == MOTOR_STATE_STOPPING)
+        if (state == MOTOR_STATE_STOPPING ||
+            state == MOTOR_STATE_ESTOP_BRAKING ||
+            state == MOTOR_STATE_FAULT_LATCHED)
         {
             rpm_desired = 0;
         }
@@ -522,7 +525,9 @@ static void prvMotorTask(void *pvParameters)
             break;
 
         case MOTOR_STATE_STARTING:
-            g_motor_estop_armed = false;
+            /* Arm accel/distance E-stop immediately after START.
+             * Keep power E-stop delayed until soft-start settles. */
+            g_motor_estop_armed = true;
             g_motor_power_estop_ok = false;
             {
                 int32_t rpm_f = speed_sensor_get_rpm();
@@ -562,15 +567,14 @@ static void prvMotorTask(void *pvParameters)
             break;
 
         case MOTOR_STATE_RUNNING:
+            g_motor_estop_armed = true;
             if (rpm_reference >= POWER_ESTOP_ARM_REF_RPM)
             {
                 g_motor_power_estop_ok = true;
-                g_motor_estop_armed = true;
             }
             else
             {
                 g_motor_power_estop_ok = false;
-                g_motor_estop_armed = false;
             }
             break;
 

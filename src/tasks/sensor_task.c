@@ -466,7 +466,7 @@ static void prvSensorTask(void *pvParameters)
         AccelSampleRaw_t araw;
         const float lsb_per_g = bmi160_lsb_per_g();
         float       peak_total_g = 0.0f;
-        bool        accel_estop_active = g_motor_power_estop_ok;
+        bool        accel_estop_active = g_motor_estop_armed;
 
         while (xQueueReceive(xAccelRawQueue, &araw, 0) == pdPASS)
         {

@@ -455,9 +455,5 @@ int32_t speed_sensor_get_rpm_display(void)
             return g_rpm_raw;
         }
     }
-    if (g_rpm_disp_meas > 0 && g_rpm_display < g_rpm_disp_meas - 30)
-    {
-        return g_rpm_disp_meas;
-    }
     return g_rpm_display;
 }

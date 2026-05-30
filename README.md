@@ -28,7 +28,7 @@ Layout: `src/tasks/` (motor / sensor / gui / fault), `src/drivers/`, `src/main.c
 1. **Build / flash:** `pio run -t upload`
 2. **Serial plot** ([atomic14 Web Serial Plotter](https://web-serial-plotter.atomic14.com/) or monitor): **115200 baud**, close other serial tools first.
    - With `SERIAL_PLOT_CLEAN=1` (default): `#` header once, then CSV @ 50 Hz. Columns:
-     `sample_number`, `desired_rpm`, `reference_rpm`, `actual_rpm`, `duty_percent`, `power_milliwatts`, `light_lux`, `acceleration_millig`, `hall_display_rpm`
+     `sample_number`, `desired_rpm`, `reference_rpm`, `actual_rpm`, `duty_percent`, `power_milliwatts`, `light_lux`, `acceleration_millig`, `hall_display_rpm`, `estop_active` (0 idle, 4000 when E-stop brake / fault — visible step on plot)
    - Reset board after connect so the plotter catches the `#` header (do not repeat the header in firmware).
    - Legacy mode (`-DSERIAL_PLOT_CLEAN=0`): `M,...` motor + 15-column sensor CSV (desktop Serial Plot).
 3. **Power zero-cal:** leave **Idle** ~0.5 s before **START** (SOA/SOB ADC offset).
